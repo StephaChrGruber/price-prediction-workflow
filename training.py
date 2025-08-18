@@ -438,17 +438,43 @@ def time_split_idx(n: int, val_ratio: float = 0.2):
     return idx[: n - val_n], idx[n - val_n :]
 
 
-def walk_forward_splits(dates: np.ndarray, train_span_days=365*3, val_span_days=90, step_days=90):
-    dates = pd.to_datetime(dates); start, end = dates.min(), dates.max()
-    anchor = start + pd.Timedelta(days=train_span_days)
+def walk_forward_splits(dates,
+                        train_span_days=365*3,
+                        val_span_days=90,
+                        step_days=90):
+    # Normalize to numpy datetime64[ns] array (keeps order, no index semantics)
+    dates = pd.to_datetime(dates)
+    dates = dates.to_numpy() if hasattr(dates, "to_numpy") else np.asarray(dates, dtype="datetime64[ns]")
+
+    if dates.size == 0:
+        return  # nothing to yield
+
+    start = dates.min()
+    end   = dates.max()
+
+    train_span = np.timedelta64(train_span_days, "D")
+    val_span   = np.timedelta64(val_span_days, "D")
+    step       = np.timedelta64(step_days, "D")
+
+    anchor = start + train_span
+
     while True:
-        train_end = anchor; val_end = train_end + pd.Timedelta(days=val_span_days)
-        if train_end > end or val_end > end: break
-        tr = ((dates > train_end - pd.Timedelta(days=train_span_days)) & (dates <= train_end)).to_numpy()
-        va = ((dates > train_end) & (dates <= val_end)).to_numpy()
-        tr_idx, va_idx = np.nonzero(tr)[0], np.nonzero(va)[0]
-        if len(tr_idx) and len(va_idx): yield tr_idx, va_idx
-        anchor += pd.Timedelta(days=step_days)
+        train_end = anchor
+        val_end   = train_end + val_span
+        if train_end > end or val_end > end:
+            break
+
+        # Boolean masks are NumPy arrays already — no .to_numpy() here
+        tr_mask = (dates > (train_end - train_span)) & (dates <= train_end)
+        va_mask = (dates > train_end) & (dates <= val_end)
+
+        tr_idx = np.flatnonzero(tr_mask)
+        va_idx = np.flatnonzero(va_mask)
+
+        if tr_idx.size and va_idx.size:
+            yield tr_idx, va_idx
+
+        anchor = anchor + step
 
 
 def fit_scaler_on_train(Xtr: np.ndarray) -> StandardScaler:
