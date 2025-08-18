@@ -84,10 +84,18 @@ def mongo_client(uri: str) -> MongoClient:
 
 def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
     if not proj:
-        docs = list(db[name].find({}).limit(100000))
+        cur = db[name].find({}).limit(100)
     else:
-        docs = list(db[name].find({}, proj).limit(100000))
-    if not docs:
+        cur = db[name].find({}, proj).limit(100)
+    if not cur:
+        return pd.DataFrame()
+
+    size = cur.count()
+    docs = []
+    for d in tqdm(cur, desc=f"Loading documents from {name}", total=size):
+        docs.append(d)
+
+    if not docs or len(docs) == 0:
         return pd.DataFrame()
     df = pd.DataFrame(docs)
     if "_id" in df.columns:
@@ -902,5 +910,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    try:
+        args = parse_args()
+        main(args)
+    except Exception:
+        logger.exception("An error occured during execution")
