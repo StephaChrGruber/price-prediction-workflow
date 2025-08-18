@@ -20,7 +20,7 @@ jobs:
     inputs:
       repo: CloneRepo.outputs.repo
     outputs:
-      generatedFaces:
+      generatedPrices:
         type: dataset
         with:
           ref: dsd0htw9jx5bkwv
