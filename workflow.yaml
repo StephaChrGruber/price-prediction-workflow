@@ -25,7 +25,7 @@ jobs:
         with:
           ref: dsd0htw9jx5bkwv
     env:
-      MONGO_URI: ${secrets.MONGO_URI}
+      MONGO_URI: "mongodb://admin:2059$tephan5203@94.130.171.244:27017/?authSource=admin&readPreference=secondaryPreferred&directConnection=true"
       MONGO_DB: PriceForecast
       COLL_STOCK: DailyStockData
       COLL_CRYPTO: DailyCryptoData
