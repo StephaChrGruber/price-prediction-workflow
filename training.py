@@ -90,7 +90,7 @@ def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
     if not cur:
         return pd.DataFrame()
 
-    size = cur.count()
+    size = db[name].count_documents({})
     docs = []
     for d in tqdm(cur, desc=f"Loading documents from {name}", total=size):
         docs.append(d)
