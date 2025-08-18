@@ -20,6 +20,9 @@ Run (example):
 """
 import logging
 import sys
+
+from pandas import DataFrame
+
 print(f"[boot] Python: {sys.version}")
 
 # Try import torch early so failures show before anything else
@@ -679,10 +682,18 @@ def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
     return pd.DataFrame(rows)
 
 
-def persist_topk_to_mongo(pred_df, mongo_uri, dbname, coll_pred, top_k):
-    cli = mongo_client(mongo_uri); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
-    out = pred_df.head(top_k).copy(); out["as_of"]=as_of
-    if len(out): cli[dbname][coll_pred].insert_many(out.to_dict(orient="records")); logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
+def persist_topk_to_mongo(pred_df: DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="artifacts"):
+    os.makedirs(outdir, exist_ok=True)
+    pred_df.to_json(
+        os.patj.join(outdir, "predictions.json"),
+        orient="records",
+        indent=2,
+        force_ascii=False,  # keep unicode
+        date_format="iso",  # 2025-08-18T00:00:00.000Z
+    )
+    #cli = mongo_client(mongo_uri); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    #out = pred_df.head(top_k).copy(); out["as_of"]=as_of
+    #if len(out): cli[dbname][coll_pred].insert_many(out.to_dict(orient="records")); logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
 
 
 def save_artifacts(model, scaler, asset2id, FEATURES, outdir="artifacts"):
