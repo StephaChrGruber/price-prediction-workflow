@@ -808,6 +808,7 @@ def main(args):
             raise RuntimeError("No training samples after sequence build; reduce lookback or check targets.")
         quick_nan_report(X_raw, "X_raw before scaling")
         if not args.walk_forward:
+            logger.info("Not Walking Forward")
             tr_idx, va_idx = time_split_idx(len(Y), args.val_ratio)
             scaler = fit_scaler_on_train(X_raw[tr_idx])
             Xtr, Xva = apply_scaler(X_raw[tr_idx], scaler), apply_scaler(X_raw[va_idx], scaler)
@@ -833,6 +834,7 @@ def main(args):
             save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
             return
         else:
+            logger.info("Walking Forward")
             metrics = []
             for i, (tr_idx, va_idx) in enumerate(walk_forward_splits(D, args.train_span_days, args.val_span_days, args.step_days), 1):
                 logger.info(f"\n[fold {i}] train={len(tr_idx)} val={len(va_idx)}")
