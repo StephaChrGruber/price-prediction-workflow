@@ -5,7 +5,7 @@
 jobs:
   CloneRepo:
     resources:
-      instance-type: C5
+      instance-type: C7
     outputs:
       repo:
         type: volume
