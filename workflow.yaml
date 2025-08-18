@@ -69,11 +69,10 @@ jobs:
       ARTIFACTS_DIR: "artifacts"
     uses: script@v1
     with:
-      script:
-        - cd /inputs/repo
-        - pip install -r requirements.txt
-      # If you saved the script under a different name (e.g., train.py), update the line below.
-        - python training.py
+      script: |-
+        cd /inputs/repo
+        pip install -r requirements.txt
+        python training.py
       image: tensorflow/tensorflow:1.14.0-gpu-py3
 #schedules:
   # Weekly retrain: Mondays 02:00 UTC
