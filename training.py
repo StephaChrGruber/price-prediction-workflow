@@ -522,7 +522,9 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
         logger.info(f"Train {tl:.5f} | Val {vl:.5f}")
         if vl < best - 1e-4: best, best_state, bad = vl, copy.deepcopy(model.state_dict()), 0
         else:
-            bad += 1; if bad > patience: logger.info("Early stop"); break
+            bad += 1
+            if bad > patience: logger.info("Early stop")
+            break
     model.load_state_dict(best_state); return model, best
 
 
@@ -550,7 +552,10 @@ def train_quant(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
         logger.info(f"[Q] Train {tl:.5f} | Val {vl:.5f}")
         if vl < best - 1e-4: best, best_state, bad = vl, copy.deepcopy(model.state_dict()), 0
         else:
-            bad += 1; if bad>patience: logger.info("Early stop"); break
+            bad += 1
+            if bad>patience:
+                logger.info("Early stop")
+                break
     model.load_state_dict(best_state); return model, best
 
 # ==========================
