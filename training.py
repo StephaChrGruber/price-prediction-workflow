@@ -932,5 +932,5 @@ if __name__ == "__main__":
         args = parse_args()
         logger.info("Starting main")
         main(args)
-    except Exception as e:
-        logger.error(e)
+    except Exception:
+        logger.exception("Error during execution")
