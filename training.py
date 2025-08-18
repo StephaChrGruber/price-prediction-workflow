@@ -495,9 +495,9 @@ class SeqDS(Dataset):
 
 def _first_batch_nan_guard(x, y):
     if torch.isnan(x).any() or torch.isinf(x).any():
-        logger.info("[FATAL] Non-finite in X batch"); idx = torch.where(~torch.isfinite(x)); logger.info("indices:", [t[:5].tolist() for t in idx]); raise SystemExit(1)
+        logger.info("[FATAL] Non-finite in X batch"); idx = torch.where(~torch.isfinite(x)); logger.info(f"indices: {[t[:5].tolist() for t in idx]}"); raise SystemExit(1)
     if torch.isnan(y).any() or torch.isinf(y).any():
-        logger.info("[FATAL] Non-finite in Y batch"); idx = torch.where(~torch.isfinite(y)); logger.info("indices:", [t[:5].tolist() for t in idx]); raise SystemExit(1)
+        logger.info("[FATAL] Non-finite in Y batch"); idx = torch.where(~torch.isfinite(y)); logger.info(f"indices: {[t[:5].tolist() for t in idx]}"); raise SystemExit(1)
 
 
 def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=5):
@@ -674,7 +674,7 @@ def quick_nan_report(X, name="X"):
     bad = ~np.isfinite(X)
     if bad.any():
         i = np.where(bad)
-        logger.info(f"[WARN] Non-finite in {name}: count={bad.sum()} at first example/t/f=", (i[0][0], i[1][0], i[2][0]))
+        logger.info(f"[WARN] Non-finite in {name}: count={bad.sum()} at first example/t/f={i[0][0]},{i[1][0]},{i[2][0]}")
 
 
 def main(args):
@@ -767,7 +767,7 @@ def main(args):
                     model = PriceForecastMulti(Xtr.shape[-1], len(asset2id), H, args.hidden, args.layers, args.dropout)
                     model, best = train_point(model, tr_dl, va_dl, device, args.epochs, args.lr, args.weight_decay)
                 metrics.append(best)
-            logger.info("[walk-forward] val losses:", metrics)
+            logger.info(f"[walk-forward] val losses: {metrics}")
             if args.use_quantiles:
                 pred_df = score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device)
                 rank_col = f"pred_{args.rank_horizon}_p{int(args.rank_quantile*100)}_logret"
