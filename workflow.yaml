@@ -5,16 +5,29 @@
 
 name: price-forecast-workspace
 
-workspace:
-  repo: https://github.com/StephaChrGruber/price-prediction-workflow.git
-  ref: main
-
 jobs:
-  - name: train
+  CloneRepo:
+    resources:
+      instance-type: C5
+    outputs:
+      repo:
+        type: volume
+    uses: git-checkout@v1
+    with:
+      url: https://github.com/StephaChrGruber/price-prediction-workflow.git
+  TrainPricePrediction:
     image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
-    machine: A100-40G   # Pick a machine your account has access to (e.g., A100-40G, A5000, P5000, C10)
-
-    # Environment variables: tweak these or set via UI. Secrets are referenced via ${secrets.NAME}
+    resources:
+      instance-type: P4000
+    needs:
+      - CloneRepo
+    inputs:
+      repo: CloneRepo.outputs.repo
+    outputs:
+      generatedFaces:
+        type: dataset
+        with:
+          ref: dsd0htw9jx5bkwv
     env:
       MONGO_URI: ${secrets.MONGO_URI}
       MONGO_DB: PriceForecast
@@ -58,12 +71,13 @@ jobs:
       RANK_HORIZON: "1y"           # one of {1m,6m,1y}
       RANK_QUANTILE: "0.5"         # used when USE_QUANTILES=true
       ARTIFACTS_DIR: "artifacts"
-
-    commands:
-      - pip install -r requirements.txt
+    uses: script@v1
+    with:
+      script: |-
+        pip install -r requirements.txt
       # If you saved the script under a different name (e.g., train.py), update the line below.
-      - python training.py
-
+        python training.py
+      image: tensorflow/tensorflow:1.14.0-gpu-py3
 #schedules:
   # Weekly retrain: Mondays 02:00 UTC
 #  - cron: "0 2 * * 1"
