@@ -16,7 +16,6 @@ jobs:
     with:
       url: https://github.com/StephaChrGruber/price-prediction-workflow.git
   TrainPricePrediction:
-    image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
     resources:
       instance-type: P4000
     needs:
