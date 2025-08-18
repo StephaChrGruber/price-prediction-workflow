@@ -623,7 +623,7 @@ def save_artifacts(model, scaler, asset2id, FEATURES, outdir="artifacts"):
 def parse_args():
     p = argparse.ArgumentParser(description="Custom forecaster (null‑safe)")
     # Mongo
-    p.add_argument("--mongo-uri", default=os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+    p.add_argument("--mongo-uri", default=os.getenv("MONGO_URI", "mongodb://admin:2059$tephan5203@94.130.171.244:27017/?authSource=admin&readPreference=secondaryPreferred&directConnection=true"))
     p.add_argument("--db", default=os.getenv("MONGO_DB", "PriceForecast"))
     p.add_argument("--coll-stock", default=os.getenv("COLL_STOCK", "DailyStockData"))
     p.add_argument("--coll-crypto", default=os.getenv("COLL_CRYPTO", "DailyCryptoData"))
