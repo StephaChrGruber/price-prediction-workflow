@@ -84,9 +84,9 @@ def mongo_client(uri: str) -> MongoClient:
 
 def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
     if not proj:
-        cur = db[name].find({})
+        cur = db[name].find({}).limit(1000)
     else:
-        cur = db[name].find({}, proj)
+        cur = db[name].find({}, proj).limit(1000)
     if not cur:
         return pd.DataFrame()
 
