@@ -18,6 +18,39 @@ Run (example):
     --coll-weather DailyWeatherData --coll-pred Predictions
 
 """
+
+# --- diagnostics.py (top of training.py) ---
+import os, sys, time, signal, threading
+
+# 1) Always print tracebacks on crashes/timeouts
+import faulthandler; faulthandler.enable()
+# Dump stack on SIGTERM or when we poke SIGUSR1
+faulthandler.register(signal.SIGTERM, all_threads=True, chain=False)
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+except Exception:
+    pass  # not all OSes have SIGUSR1
+
+# 2) Lightweight heartbeat so you see life signs in logs
+def heartbeat(msg="[hb] alive", every=30):
+    def _beat():
+        while True:
+            print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+            time.sleep(every)
+    t = threading.Thread(target=_beat, daemon=True); t.start()
+heartbeat()
+
+# 3) Memory logger (RSS), helps spot growth before OOM
+try:
+    import psutil
+    def log_mem(tag):
+        rss = psutil.Process().memory_info().rss / (1024**3)
+        print(f"[mem] {tag}: rss={rss:.2f} GB", flush=True)
+except Exception:
+    def log_mem(tag): pass
+
+print(f"[boot] py={sys.version}")
+
 import logging
 import sys
 
@@ -42,7 +75,6 @@ from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
-from pymongo import MongoClient
 from tqdm import tqdm
 
 from sklearn.preprocessing import StandardScaler
@@ -52,6 +84,11 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import joblib
+
+from typing import Iterator, Optional, Dict, Any, Tuple
+from pymongo import MongoClient
+from bson import ObjectId
+import numpy as np, os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,8 +121,44 @@ def safe_log(x: np.ndarray | pd.Series) -> np.ndarray:
 # ==========================
 
 def mongo_client(uri: str) -> MongoClient:
-    return MongoClient(uri)
+    return MongoClient(uri,compressors="zstd,snappy",             # if enabled on server
+    serverSelectionTimeoutMS=20_000,
+    socketTimeoutMS=600_000,
+    connectTimeoutMS=20_000,
+    maxPoolSize=8)
 
+def iter_mongo_df_chunks(
+    coll,
+    query: Optional[Dict[str, Any]] = None,
+    projection: Optional[Dict[str, int]] = None,
+    chunk_rows: int = 200_000,
+    batch_size_db: int = 5_000,
+    start_id: Optional[str] = None
+) -> Iterator[Tuple[pd.DataFrame, str]]:
+    query = dict(query or {})
+    projection = projection or {}
+    last_id = ObjectId(start_id) if start_id else None
+
+    while True:
+        q = query.copy()
+        if last_id:
+            q["_id"] = {"$gt": last_id}
+
+        cur = (coll.find(q, projection, no_cursor_timeout=True)
+                 .sort([("_id", 1)])
+                 .limit(chunk_rows)
+                 .batch_size(batch_size_db))
+
+        docs = list(cur); cur.close()
+        if not docs:
+            break
+
+        last_id = docs[-1]["_id"]
+        for d in docs:
+            d.pop("_id", None)  # or keep str(d["_id"])
+
+        df = pd.DataFrame.from_records(docs)
+        yield df, str(last_id)
 
 def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
     if not proj:
@@ -106,6 +179,40 @@ def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
     if "_id" in df.columns:
         df = df.drop(columns=["_id"])
     return df
+
+import pyarrow as pa, pyarrow.parquet as pq
+
+def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200_000):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    ckpt = out_path + ".ckpt"
+    start_id = None
+    if os.path.exists(ckpt):
+        start_id = open(ckpt).read().strip() or None
+
+    writer = None
+    try:
+        for i, (df, last_id) in enumerate(iter_mongo_df_chunks(
+            coll, query=query, projection=projection, chunk_rows=chunk_rows
+        )):
+            log_mem(f"chunk {i} before write")
+            # downcast floats/ints to cut memory
+            for c in df.select_dtypes(include=["float64"]).columns:
+                df[c] = pd.to_numeric(df[c], downcast="float")
+            for c in df.select_dtypes(include=["int64"]).columns:
+                df[c] = pd.to_numeric(df[c], downcast="integer")
+
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, table.schema, compression="zstd")
+            writer.write_table(table)
+
+            with open(ckpt, "w") as f:
+                f.write(last_id)
+            print(f"[stage] wrote chunk {i}, rows={len(df)}")
+            log_mem(f"chunk {i} after write")
+    finally:
+        if writer: writer.close()
+
 
 # ==========================
 # Schema‑aware loaders
@@ -772,18 +879,24 @@ def main(args):
     else:
         HORIZONS = cal; HLAB = {7: "1w", 30:"1m",182:"6m",365:"1y"}
 
+
     logger.info("Connecting to MongoDB")
     cli = mongo_client(args.mongo_uri); db = cli[args.db]
-    logger.info("Loading stock data")
-    stock  = _load_coll(db, args.coll_stock)
-    logger.info("Loading crypto data")
-    crypto = _load_coll(db, args.coll_crypto)
-    logger.info("Loading fx data")
-    fx     = _load_coll(db, args.coll_fx)
-    logger.info("Loading news data")
-    news   = _load_coll(db, args.coll_news)
-    logger.info("Loading weather data")
-    wxraw  = _load_coll(db, args.coll_weather)
+
+    stage_collection(db.DailyStockData, "data/DailyStockData.parquet",
+                     projection={"date": 1, "symbol": 1, "open": 1, "close": 1, "high": 1, "low": 1, "volume": 1})
+    stage_collection(db.DailyCryptoData, "data/DailyCryptoData.parquet")
+    stage_collection(db.DailyWeatherData, "data/DailyWeatherData.parquet")
+    stage_collection(db.NewsHeadlines, "data/NewsHeadlines.parquet",
+                     projection={"date": 1, "headline": 1, "sentiment": 1, "embeddings": 1})
+    stage_collection(db.DailyCurrencyExchangeRates, "data/DailyCurrencyExchangeRates.parquet")
+
+
+    stock  = _pd.read_parquet("data/DailyStockData.parquet")
+    crypto = pd.read_parquet("data/DailyCryptoData.parquet")
+    fx     = pd.read_parquet("data/DailyCurrencyExchangeRates.parquet")
+    news   = pd.read_parquet("data/NewsHeadlines.parquet")
+    wxraw  = pd.read_parquet("data/DailyWeatherData.parquet")
 
     logger.info(f"[data] rows: stock={len(stock)} crypto={len(crypto)} fx={len(fx)} news={len(news)} weather={len(wxraw)}")
 
