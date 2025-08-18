@@ -71,9 +71,10 @@ jobs:
     with:
       script: |-
         cd /inputs/repo
+        pip install --upgrade pip
         pip install -r requirements.txt
-        python training.py
-      image: tensorflow/tensorflow:1.14.0-gpu-py3
+        python -X faulthandler training.py
+      image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 #schedules:
   # Weekly retrain: Mondays 02:00 UTC
 #  - cron: "0 2 * * 1"

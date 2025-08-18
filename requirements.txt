@@ -1,11 +1,7 @@
-gradient
 pandas
 numpy
 pymongo
 python-dotenv
 scikit-learn
-torch
-torchvision
-torchaudio
 tqdm
 pyarrow
