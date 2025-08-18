@@ -731,15 +731,22 @@ def main(args):
     else:
         HORIZONS = cal; HLAB = {7: "1w", 30:"1m",182:"6m",365:"1y"}
 
+    logger.info("Connecting to MongoDB")
     cli = mongo_client(args.mongo_uri); db = cli[args.db]
+    logger.info("Loading stock data")
     stock  = _load_coll(db, args.coll_stock)
+    logger.info("Loading crypto data")
     crypto = _load_coll(db, args.coll_crypto)
+    logger.info("Loading fx data")
     fx     = _load_coll(db, args.coll_fx)
+    logger.info("Loading news data")
     news   = _load_coll(db, args.coll_news)
+    logger.info("Loading weather data")
     wxraw  = _load_coll(db, args.coll_weather)
 
     logger.info(f"[data] rows: stock={len(stock)} crypto={len(crypto)} fx={len(fx)} news={len(news)} weather={len(wxraw)}")
 
+    logger.info("Preparing panel")
     panel, asset2id = prepare_panel(stock, crypto, fx, news)
 
     if args.use_trading_days:
@@ -747,6 +754,7 @@ def main(args):
     else:
         panel, TARGET_COLS, MASK_COLS = add_calendar_targets(panel, HORIZONS)
 
+    logger.info("Preparing weather panel")
     wx_daily = prep_weather_daily(wxraw, agg=args.weather_agg)
 
     if not args.walk_forward or not args.fold_aware_weather_pca:
