@@ -38,7 +38,7 @@ jobs:
       LOOKBACK: "180"
       HORIZONS_TD: "5,21,126,252"     # 1m, 6m, 1y in trading days
       HORIZONS_CAL: "7,30,182,365"    # 1m, 6m, 1y in calendar days
-      USE_TRADING_DAYS: "true"      # set to "false" to use calendar horizons
+      USE_TRADING_DAYS: "false"      # set to "false" to use calendar horizons
 
       # Quantiles (optional)
       USE_QUANTILES: "true"         # "true" → p50/p90; "false" → point estimates
