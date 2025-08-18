@@ -104,6 +104,11 @@ def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
 def to_dt(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
 
+EPS = 1e-6
+
+def safe_log(x: np.ndarray) -> np.ndarray:
+    # clip to avoid log(0) / negative
+    return np.log(np.clip(x, EPS, None))
 
 def prep_stocks(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -179,7 +184,7 @@ def prep_fx(df: pd.DataFrame) -> pd.DataFrame:
     d = d.sort_values(TIME_COL)
     # log returns per rate, then mean across rates per day
     for c in rate_cols:
-        d[f"lr_{c}"] = np.log(d[c]).diff()
+        d[f"lr_{c}"] = safe_log(d[c]).diff()
     lr_cols = [f"lr_{c}" for c in rate_cols]
     out = d[[TIME_COL] + lr_cols].copy()
     out["eur_fx_logret"] = out[lr_cols].mean(axis=1, skipna=True).fillna(0.0)
@@ -302,9 +307,9 @@ def prepare_panel(stock_df, crypto_df, fx_df, news_df) -> Tuple[pd.DataFrame, Di
         for col in ["volume", "quote_asset_volume", "num_trades", "taker_buy_base_vol", "taker_buy_quote_vol"]:
             g[col] = g[col] * g["is_trading_day"].fillna(0)
         # Technicals
-        g["logret_1d"] = np.log(g["close"]).diff().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        g["logret_1d"] = safe_log(g["close"]).diff().replace([np.inf, -np.inf], np.nan).fillna(0.0)
         g["vol_20d"]   = g["logret_1d"].rolling(20, min_periods=1).std().fillna(0.0)
-        g["mom_63d"]   = (np.log(g["close"]).diff(63)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        g["mom_63d"]   = (safe_log(g["close"]).diff(63)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         g["hl_spread"] = ((g["high"] - g["low"]) / g["close"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         # Restore id columns
         g[SYMBOL_COL] = sym
@@ -422,7 +427,7 @@ def add_calendar_targets(panel: pd.DataFrame, horizons_days: List[int]):
     tcols, mcols = [], []
     for h in horizons_days:
         tcol, mcol = f"target_{h}d", f"mask_{h}d"
-        panel[tcol] = panel.groupby(SYMBOL_COL)["close"].transform(lambda s: np.log(s.shift(-h)) - np.log(s))
+        panel[tcol] = panel.groupby(SYMBOL_COL)["close"].transform(lambda s: safe_log(s.shift(-h)) - safe_log(s))
         panel[mcol] = panel[tcol].replace([np.inf, -np.inf], np.nan).notna().astype(int)
         tcols.append(tcol); mcols.append(mcol)
     return panel, tcols, mcols
@@ -433,7 +438,7 @@ def add_trading_targets(panel: pd.DataFrame, horizons_td: List[int]):
     for sym, g in panel.groupby(SYMBOL_COL, sort=False):
         g = g.sort_values(TIME_COL).copy()
         td_idx = g.index[g["is_trading_day"] == 1]
-        logc = np.log(g.loc[td_idx, "close"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).ffill().values
+        logc = safe_log(g.loc[td_idx, "close"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).ffill().values
         for h in horizons_td:
             tcol, mcol = f"target_td{h}", f"mask_td{h}"
             fut = np.roll(logc, -h)
