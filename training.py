@@ -136,7 +136,7 @@ def iter_mongo_df_chunks(
     start_id: Optional[str] = None
 ) -> Iterator[Tuple[pd.DataFrame, str]]:
     query = dict(query or {})
-    projection = projection or {}
+    projection = projection
     last_id = ObjectId(start_id) if start_id else None
 
     while True:
@@ -157,7 +157,7 @@ def iter_mongo_df_chunks(
         for d in docs:
             d.pop("_id", None)  # or keep str(d["_id"])
 
-        df = pd.DataFrame.from_records(docs)
+        df = pd.DataFrame.from_records(docs).fillna(0.0)
         yield df, str(last_id)
 
 def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
@@ -182,9 +182,133 @@ def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
 
 import pyarrow as pa, pyarrow.parquet as pq
 
+# --- map Arrow field -> pandas/numpy dtype we want to cast to ---
+def _arrow_field_to_pd_dtype(field: pa.Field):
+    t = field.type
+    if pa.types.is_timestamp(t):
+        return "datetime64[ns]"
+    if pa.types.is_string(t):
+        return "string"
+    if pa.types.is_float32(t):
+        return np.float32
+    if pa.types.is_float64(t):
+        return np.float64
+    if pa.types.is_int32(t):
+        return np.int32
+    if pa.types.is_int64(t):
+        return np.int64
+    # fallback: leave as-is
+    return None
+
+# --- align DataFrame to an Arrow schema (order + dtypes) ---
+def align_df_to_schema(df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
+    out = df.copy()
+
+    # 1) Ensure all schema columns exist (create nulls with correct dtype)
+    for field in schema:
+        name = field.name
+        if name not in out.columns:
+            if pa.types.is_timestamp(field.type):
+                out[name] = pd.Series([pd.NaT] * len(out), dtype="datetime64[ns]")
+            elif pa.types.is_string(field.type):
+                out[name] = pd.Series([None] * len(out), dtype="string")
+            elif pa.types.is_floating(field.type):
+                dt = _arrow_field_to_pd_dtype(field)
+                out[name] = pd.Series([np.nan] * len(out), dtype=dt)
+            elif pa.types.is_integer(field.type):
+                # use pandas nullable integer to allow NaN then cast later
+                out[name] = pd.Series([pd.NA] * len(out), dtype="Int64")
+            else:
+                out[name] = None
+
+    # 2) Drop extras not in schema
+    wanted = [f.name for f in schema]
+    out = out[wanted]  # <-- this also REORDERS columns to match schema
+
+    # 3) Cast each column to target dtype
+    for field in schema:
+        name = field.name
+        target = _arrow_field_to_pd_dtype(field)
+        try:
+            if target == "datetime64[ns]":
+                out[name] = pd.to_datetime(out[name], errors="coerce").astype("datetime64[ns]")
+            elif target == "string":
+                out[name] = out[name].astype("string")
+            elif target in (np.float32, np.float64):
+                out[name] = pd.to_numeric(out[name], errors="coerce").astype(target)
+            elif target in (np.int32, np.int64):
+                # to numeric, allow NaN → fill or keep NA, then cast
+                out[name] = pd.to_numeric(out[name], errors="coerce")
+                # choose behavior: keep NaN as 0 before cast, or use pandas nullable int
+                # here we keep NaN -> 0 to guarantee cast; tweak if you prefer NA
+                out[name] = out[name].fillna(0).astype(target)
+        except Exception as e:
+            print(f"[align] cast failed for column '{name}' to {target}: {e}")
+
+    return out
+
+# --- staging that respects existing file schema and enforces order ---
+def stage_collection_with_schema(
+    out_path: str,
+    iter_chunks_fn,                 # callable(start_id) -> yields (df, last_id)
+    canonical_schema: pa.Schema|None = None,
+    resume: bool = True,
+    compression: str = "zstd",
+):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    ckpt = out_path + ".ckpt"
+
+    # Determine target schema:
+    #   - If file exists, use its schema (order + dtypes).
+    #   - Else, use the provided canonical_schema (if any).
+    target_schema = None
+    if os.path.exists(out_path):
+        try:
+            target_schema = pq.ParquetFile(out_path).schema_arrow
+            print("[stage] Using existing file schema:", target_schema)
+        except Exception as e:
+            print("[stage] Cannot read existing schema:", e)
+
+    if target_schema is None:
+        target_schema = canonical_schema
+
+    # Resume checkpoint
+    start_id = None
+    if resume and os.path.exists(ckpt):
+        start_id = (open(ckpt).read().strip() or None)
+
+    writer = None
+    try:
+        for i, (df, last_id) in enumerate(iter_chunks_fn(start_id)):
+            # If we already know the schema (existing file or canonical), align now.
+            if target_schema is not None:
+                df = align_df_to_schema(df, target_schema)
+                table = pa.Table.from_pandas(df, preserve_index=False, schema=target_schema)
+            else:
+                # First chunk with no schema: infer from this chunk and freeze it
+                table = pa.Table.from_pandas(df, preserve_index=False)
+                target_schema = table.schema
+                # Re-align (guarantees consistent order for future chunks)
+                df = align_df_to_schema(df, target_schema)
+                table = pa.Table.from_pandas(df, preserve_index=False, schema=target_schema)
+
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, target_schema, compression=compression)
+                print("[stage] Writer created with schema:", target_schema)
+
+            writer.write_table(table)
+            with open(ckpt, "w") as f:
+                f.write(last_id)
+            print(f"[stage] wrote chunk {i}, rows={len(df)}, checkpoint={last_id}")
+    finally:
+        if writer is not None:
+            writer.close()
+
+
 def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200_000):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     ckpt = out_path + ".ckpt"
+
     start_id = None
     if os.path.exists(ckpt):
         start_id = open(ckpt).read().strip() or None
@@ -195,15 +319,11 @@ def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200
             coll, query=query, projection=projection, chunk_rows=chunk_rows
         )):
             log_mem(f"chunk {i} before write")
-            # downcast floats/ints to cut memory
-            for c in df.select_dtypes(include=["float64"]).columns:
-                df[c] = pd.to_numeric(df[c], downcast="float")
-            for c in df.select_dtypes(include=["int64"]).columns:
-                df[c] = pd.to_numeric(df[c], downcast="integer")
 
             table = pa.Table.from_pandas(df, preserve_index=False)
+            schema = table.schema
             if writer is None:
-                writer = pq.ParquetWriter(out_path, table.schema, compression="zstd")
+                writer = pq.ParquetWriter(out_path, schema, compression="zstd")
             writer.write_table(table)
 
             with open(ckpt, "w") as f:
@@ -790,6 +910,59 @@ def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
         rows.append(out)
     return pd.DataFrame(rows)
 
+def sanitize_list_column(series: pd.Series,
+                         item_dtype=np.float32,
+                         fixed_len: int | None = None,
+                         fill_value: float = 0.0) -> pd.Series:
+    def _fix(x):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            a = np.full((fixed_len,), fill_value, dtype=item_dtype) if fixed_len else np.array([], dtype=item_dtype)
+            return a.tolist()
+        a = np.asarray(x, dtype=item_dtype).reshape(-1)
+        if fixed_len is not None:
+            if a.size < fixed_len:
+                a = np.pad(a, (0, fixed_len - a.size), constant_values=fill_value)
+            elif a.size > fixed_len:
+                a = a[:fixed_len]
+        return a.tolist()
+    return series.apply(_fix)
+
+def table_from_df_and_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
+    arrays = []
+    names  = []
+    for field in schema:
+        name, typ = field.name, field.type
+        names.append(name)
+        col = df[name] if name in df.columns else pd.Series([None] * len(df))
+
+        if pa.types.is_timestamp(typ):
+            arr = pa.array(pd.to_datetime(col, errors="coerce"), type=typ)
+        elif pa.types.is_string(typ):
+            arr = pa.array(col.astype("string"))
+        elif pa.types.is_float32(typ):
+            arr = pa.array(pd.to_numeric(col, errors="coerce").astype(np.float32))
+        elif pa.types.is_float64(typ):
+            arr = pa.array(pd.to_numeric(col, errors="coerce").astype(np.float64))
+        elif pa.types.is_int32(typ) or pa.types.is_int64(typ):
+            vals = pd.to_numeric(col, errors="coerce").fillna(0)
+            arr = pa.array(vals.astype(np.int32 if pa.types.is_int32(typ) else np.int64))
+        elif pa.types.is_fixed_size_list(typ):
+            # Ensure sanitize_list_column was applied; enforce dtype/length
+            item_t  = typ.value_type
+            list_sz = typ.list_size
+            seq = col.apply(lambda v: v if isinstance(v, (list, tuple, np.ndarray)) else []).tolist()
+            # Arrow will validate sizes; seq elements must be length == list_sz
+            arr = pa.array(seq, type=typ)
+        elif pa.types.is_list(typ):
+            item_t = typ.value_type
+            seq = col.apply(lambda v: v if isinstance(v, (list, tuple, np.ndarray)) else []).tolist()
+            arr = pa.array(seq, type=typ)  # variable-length lists are fine
+        else:
+            # Fallback (rare)
+            arr = pa.array(col.tolist())
+        arrays.append(arr)
+
+    return pa.Table.from_arrays(arrays, names=names)
 
 def persist_topk_to_mongo(pred_df: DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="outputs"):
     os.makedirs(outdir, exist_ok=True)
@@ -865,7 +1038,6 @@ def quick_nan_report(X, name="X"):
         i = np.where(bad)
         logger.info(f"[WARN] Non-finite in {name}: count={bad.sum()} at first example/t/f={i[0][0]},{i[1][0]},{i[2][0]}")
 
-
 def main(args):
     logger.info("[boot] starting main()")
     set_seed(args.seed)
@@ -883,16 +1055,213 @@ def main(args):
     logger.info("Connecting to MongoDB")
     cli = mongo_client(args.mongo_uri); db = cli[args.db]
 
-    stage_collection(db.DailyStockData, "data/DailyStockData.parquet",
-                     projection={"date": 1, "symbol": 1, "open": 1, "close": 1, "high": 1, "low": 1, "volume": 1})
-    stage_collection(db.DailyCryptoData, "data/DailyCryptoData.parquet")
-    stage_collection(db.DailyWeatherData, "data/DailyWeatherData.parquet")
-    stage_collection(db.NewsHeadlines, "data/NewsHeadlines.parquet",
-                     projection={"date": 1, "headline": 1, "sentiment": 1, "embeddings": 1})
-    stage_collection(db.DailyCurrencyExchangeRates, "data/DailyCurrencyExchangeRates.parquet")
+    def iter_stocks_chunks(start_id=None):
+        for df, last_id in iter_mongo_df_chunks(
+                db.DailyStockData,
+                projection={"date": 1, "symbol": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+                chunk_rows=200_000,
+                start_id=start_id
+        ):
+            yield df, last_id
+
+    def stock_schema(float_bits=32) -> pa.Schema:
+        f = pa.float32() if float_bits == 32 else pa.float64()
+        return pa.schema([
+            pa.field("date", pa.timestamp("ns")),
+            pa.field("symbol", pa.string()),
+            pa.field("open", f),
+            pa.field("high", f),
+            pa.field("low", f),
+            pa.field("close", f),
+            pa.field("volume", f),
+        ])
+
+    stage_collection_with_schema(
+                                out_path="data/DailyStockData.parquet",
+                                iter_chunks_fn=iter_stocks_chunks,
+                                canonical_schema=stock_schema(32),  # used only if file doesn't exist yet
+                                resume=True,
+                                compression="zstd")
+
+    def iter_crypto_chunks(start_id=None):
+        for df, last_id in iter_mongo_df_chunks(
+                db.DailyCryptoData,
+                chunk_rows=200_000,
+                start_id=start_id
+        ):
+            yield df, last_id
+
+    def crypto_schema(float_bits=32) -> pa.Schema:
+        f = pa.float32() if float_bits == 32 else pa.float64()
+        return pa.schema([
+            pa.field("date", pa.timestamp("ns")),
+            pa.field("symbol", pa.string()),
+            pa.field("open", f),
+            pa.field("high", f),
+            pa.field("low", f),
+            pa.field("close", f),
+            pa.field("volume", f),
+            pa.field("quote_asset_volume", f),
+            pa.field("num_trades", f),
+            pa.field("taker_buy_base_vol", f),
+            pa.field("taker_buy_quote_vol", f),
+            pa.field("closePctChange", f),
+            pa.field("openPctChange", f)
+        ])
+
+    stage_collection_with_schema(out_path="data/DailyCryptoData.parquet",
+                                iter_chunks_fn=iter_crypto_chunks,
+                                canonical_schema=crypto_schema(32),  # used only if file doesn't exist yet
+                                resume=True,
+                                compression="zstd")
+
+    def iter_weather_chunks(start_id=None):
+        for df, last_id in iter_mongo_df_chunks(
+                db.DailyWeatherData,
+                chunk_rows=200_000,
+                start_id=start_id
+        ):
+            yield df, last_id
+
+    def weather_schema(float_bits=32) -> pa.Schema:
+        f = pa.float32() if float_bits == 32 else pa.float64()
+        return pa.schema([
+            pa.field("date", pa.timestamp("ns")),
+            pa.field("country", pa.string()),
+            pa.field("station", pa.string()),
+            pa.field("tavg", f),
+            pa.field("tmin", f),
+            pa.field("tmax", f),
+            pa.field("prcp", f),
+            pa.field("snow", f),
+            pa.field("wdir", f),
+            pa.field("wspd", f),
+            pa.field("wpgt", f),
+            pa.field("pres", f),
+            pa.field("tsun", f)
+        ])
+
+    stage_collection_with_schema(out_path="data/DailyWeatherData.parquet",
+                                iter_chunks_fn=iter_weather_chunks,
+                                canonical_schema=weather_schema(32),  # used only if file doesn't exist yet
+                                resume=True,
+                                compression="zstd")
+
+    def news_schema() -> pa.Schema:
+        return pa.schema([
+            pa.field("date", pa.timestamp("ns")),
+            pa.field("headline", pa.string()),
+            # list<float32> (variable length)
+            pa.field("sentiment", pa.list_(pa.float32())),
+            # fixed_size_list<float32, 512> (exactly 512 elements per row)
+            pa.field("embeddings", pa.list_(pa.float32(), 512)),
+        ])
+
+    def iter_news_chunks(start_id=None):
+        for df, last_id in iter_mongo_df_chunks(
+                db.NewsHeadlines,
+                projection={"date": 1, "headline": 1, "sentiment": 1, "embeddings": 1},
+                chunk_rows=200_000,
+                start_id=start_id
+        ):
+            # sanitize arrays
+            df["sentiment"] = sanitize_list_column(df.get("sentiment"), np.float32, fixed_len=None)
+            df["embeddings"] = sanitize_list_column(df.get("embeddings"), np.float32, fixed_len=512)
+            yield df, last_id
+
+    def stage_news(out_path="data/NewsHeadlines.parquet", resume=True):
+        schema = news_schema()
+        # If the file exists, read its schema so we match order/types:
+        target_schema = schema
+        if os.path.exists(out_path):
+            try:
+                target_schema = pq.ParquetFile(out_path).schema_arrow
+            except Exception:
+                pass
+
+        writer = None
+        ckpt = out_path + ".ckpt"
+        start_id = open(ckpt).read().strip() if (resume and os.path.exists(ckpt)) else None
+        try:
+            for i, (df, last_id) in enumerate(iter_news_chunks(start_id)):
+                tbl = table_from_df_and_schema(df, target_schema)
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, tbl.schema, compression="zstd")
+                writer.write_table(tbl)
+                with open(ckpt, "w") as f:
+                    f.write(last_id)
+                print(f"[news] wrote chunk {i} rows={len(df)}")
+        finally:
+            if writer: writer.close()
+
+    stage_news()
+
+    def iter_fx_chunks(start_id=None):
+        for df, last_id in iter_mongo_df_chunks(
+                db.DailyCurrencyExchangeRates,
+                chunk_rows=200_000,
+                start_id=start_id
+        ):
+            yield df, last_id
+
+    def fx_schema(float_bits=32) -> pa.Schema:
+        f = pa.float32() if float_bits == 32 else pa.float64()
+        return pa.schema([
+            pa.field("date", pa.timestamp("ns")),
+            pa.field("base_currency", pa.string()),
+            pa.field("AED", f), pa.field("AFN", f), pa.field("ALL", f), pa.field("AMD", f),
+            pa.field("ANG", f), pa.field("AOA", f), pa.field("ARS", f), pa.field("AUD", f),
+            pa.field("AWG", f), pa.field("AZN", f), pa.field("BAM", f), pa.field("BBD", f),
+            pa.field("BDT", f), pa.field("BGN", f), pa.field("BHD", f), pa.field("BIF", f),
+            pa.field("BMD", f), pa.field("BND", f), pa.field("BOB", f), pa.field("BRL", f),
+            pa.field("BSD", f), pa.field("BTC", f), pa.field("BTN", f), pa.field("BWP", f),
+            pa.field("BYN", f), pa.field("BYR", f), pa.field("BZD", f), pa.field("CAD", f),
+            pa.field("CDF", f), pa.field("CHF", f), pa.field("CLF", f), pa.field("CLP", f),
+            pa.field("CNY", f), pa.field("CNH", f), pa.field("COP", f), pa.field("CRC", f),
+            pa.field("CUC", f), pa.field("CUP", f), pa.field("CVE", f), pa.field("CZK", f),
+            pa.field("DJF", f), pa.field("DKK", f), pa.field("DOP", f), pa.field("DZD", f),
+            pa.field("EGP", f), pa.field("ERN", f), pa.field("ETB", f), pa.field("EUR", f),
+            pa.field("FJD", f), pa.field("FKP", f), pa.field("GBP", f), pa.field("GEL", f),
+            pa.field("GGP", f), pa.field("GHS", f), pa.field("GIP", f), pa.field("GMD", f),
+            pa.field("GNF", f), pa.field("GTQ", f), pa.field("GYD", f), pa.field("HKD", f),
+            pa.field("HNL", f), pa.field("HRK", f), pa.field("HTG", f), pa.field("HUF", f),
+            pa.field("IDR", f), pa.field("ILS", f), pa.field("IMP", f), pa.field("INR", f),
+            pa.field("IQD", f), pa.field("IRR", f), pa.field("ISK", f), pa.field("JEP", f),
+            pa.field("JMD", f), pa.field("JOD", f), pa.field("JPY", f), pa.field("KES", f),
+            pa.field("KGS", f), pa.field("KHR", f), pa.field("KMF", f), pa.field("KPW", f),
+            pa.field("KRW", f), pa.field("KWD", f), pa.field("KYD", f), pa.field("KZT", f),
+            pa.field("LAK", f), pa.field("LBP", f), pa.field("LKR", f), pa.field("LRD", f),
+            pa.field("LSL", f), pa.field("LTL", f), pa.field("LVL", f), pa.field("LYD", f),
+            pa.field("MAD", f), pa.field("MDL", f), pa.field("MGA", f), pa.field("MKD", f),
+            pa.field("MMK", f), pa.field("MNT", f), pa.field("MOP", f), pa.field("MRU", f),
+            pa.field("MUR", f), pa.field("MVR", f), pa.field("MWK", f), pa.field("MXN", f),
+            pa.field("MYR", f), pa.field("MZN", f), pa.field("NAD", f), pa.field("NGN", f),
+            pa.field("NIO", f), pa.field("NOK", f), pa.field("NPR", f), pa.field("NZD", f),
+            pa.field("OMR", f), pa.field("PAB", f), pa.field("PEN", f), pa.field("PGK", f),
+            pa.field("PHP", f), pa.field("PKR", f), pa.field("PLN", f), pa.field("PYG", f),
+            pa.field("QAR", f), pa.field("RON", f), pa.field("RSD", f), pa.field("RUB", f),
+            pa.field("RWF", f), pa.field("SAR", f), pa.field("SBD", f), pa.field("SCR", f),
+            pa.field("SDG", f), pa.field("SEK", f), pa.field("SGD", f), pa.field("SHP", f),
+            pa.field("SLE", f), pa.field("SLL", f), pa.field("SOS", f), pa.field("SRD", f),
+            pa.field("STD", f), pa.field("SVC", f), pa.field("SYP", f), pa.field("SZL", f),
+            pa.field("THB", f), pa.field("TJS", f), pa.field("TMT", f), pa.field("TND", f),
+            pa.field("TOP", f), pa.field("TRY", f), pa.field("TTD", f), pa.field("TWD", f),
+            pa.field("TZS", f), pa.field("UAH", f), pa.field("UGX", f), pa.field("USD", f),
+            pa.field("UYU", f), pa.field("UZS", f), pa.field("VES", f), pa.field("VND", f),
+            pa.field("VUV", f), pa.field("WST", f), pa.field("XAF", f), pa.field("XAG", f),
+            pa.field("XAU", f), pa.field("XCD", f), pa.field("XDR", f), pa.field("XOF", f),
+            pa.field("XPF", f), pa.field("YER", f), pa.field("ZAR", f), pa.field("ZMK", f),
+            pa.field("ZMW", f), pa.field("ZWL", f),
+        ])
+
+    stage_collection_with_schema(out_path="data/DailyCurrencyExchangeRates.parquet",
+                                iter_chunks_fn=iter_fx_chunks,
+                                canonical_schema=fx_schema(32),  # used only if file doesn't exist yet
+                                resume=True,
+                                compression="zstd")
 
 
-    stock  = _pd.read_parquet("data/DailyStockData.parquet")
+    stock  = pd.read_parquet("data/DailyStockData.parquet")
     crypto = pd.read_parquet("data/DailyCryptoData.parquet")
     fx     = pd.read_parquet("data/DailyCurrencyExchangeRates.parquet")
     news   = pd.read_parquet("data/NewsHeadlines.parquet")
