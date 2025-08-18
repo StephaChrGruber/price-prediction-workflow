@@ -482,7 +482,15 @@
       <option name="project" value="LOCAL" />
       <updated>1755521334333</updated>
     </task>
-    <option name="localTasksCounter" value="49" />
+    <task id="LOCAL-00049" summary="initial commit">
+      <option name="closed" value="true" />
+      <created>1755535454875</created>
+      <option name="number" value="00049" />
+      <option name="presentableId" value="LOCAL-00049" />
+      <option name="project" value="LOCAL" />
+      <updated>1755535454876</updated>
+    </task>
+    <option name="localTasksCounter" value="50" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
@@ -494,27 +502,27 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1353</line>
+          <line>1392</line>
           <option name="timeStamp" value="40" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1256</line>
+          <line>1295</line>
           <option name="timeStamp" value="41" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1143</line>
+          <line>1182</line>
           <option name="timeStamp" value="43" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1111</line>
+          <line>1150</line>
           <option name="timeStamp" value="44" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1078</line>
+          <line>1117</line>
           <option name="timeStamp" value="45" />
         </line-breakpoint>
       </breakpoints>

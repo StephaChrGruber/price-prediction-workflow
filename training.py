@@ -505,7 +505,49 @@ def prepare_panel(stock_df, crypto_df, fx_df, news_df) -> Tuple[pd.DataFrame, Di
 
     cal = daily_calendar(prices)
     rows = []
+
+    def reduce_daily_duplicates(g: pd.DataFrame) -> pd.DataFrame:
+        """
+        Collapse duplicate rows that share the same `date` within a symbol group.
+        Uses OHLC-type rules; any other numeric columns default to 'last'.
+        """
+        g = g.copy()
+        g = g.sort_values(TIME_COL).dropna(subset=[TIME_COL])
+
+        # Build a dynamic aggregation map
+        rules = {
+            "open": "first",  # first print of the day
+            "high": "max",
+            "low": "min",
+            "close": "last",  # last print of the day
+            "volume": "sum",
+            "quote_asset_volume": "sum",
+            "num_trades": "sum",
+            "taker_buy_base_vol": "sum",
+            "taker_buy_quote_vol": "sum",
+            "closePctChange": "last",
+            "openPctChange": "last",
+        }
+        # Any other numeric columns → take last
+        num_cols = g.select_dtypes(include=[np.number]).columns.tolist()
+        for c in num_cols:
+            rules.setdefault(c, "last")
+
+        # If there are duplicates on TIME_COL, aggregate; else return as-is
+        if g[TIME_COL].duplicated().any():
+            # Keep only columns we can aggregate
+            cols = [TIME_COL] + [c for c in g.columns if c in rules]
+            agg = g[cols].groupby(TIME_COL, as_index=False).agg({c: rules[c] for c in cols if c != TIME_COL})
+            return agg
+        else:
+            return g
+
     for sym, g in prices.groupby(SYMBOL_COL):
+        g = reduce_daily_duplicates(g)
+
+        if reduce_daily_duplicates(g)[TIME_COL].duplicated().any():
+            raise RuntimeError(f"Still duplicate dates for symbol {sym}; check upstream loaders.")
+
         g = g.set_index(TIME_COL).reindex(cal)
         g["is_trading_day"] = g["close"].notna().astype(int)
         # Fill and clamp prices
