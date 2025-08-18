@@ -1,35 +1,74 @@
+# Paperspace Gradient workflow
+# Save this file as `workspace.yaml` at the root of your repo/project.
+# If you're uploading files directly to a Gradient Project (not using Git),
+# you can remove the `workspace.repo` block.
+
+name: price-forecast-workspace
+
+workspace:
+  repo: https://github.com/StephaChrGruber/price-prediction-workflow.git
+  ref: main
+
 jobs:
-  CloneRepo:
-    resources:
-      instance-type: C5
-    outputs:
-      repo:
-        type: volume
-    uses: git-checkout@v1
-    with:
-      url: https://github.com/NVlabs/stylegan2.git
-  StyleGan2:
-    resources:
-      instance-type: P4000
-    needs:
-      - CloneRepo
-    inputs:
-      repo: CloneRepo.outputs.repo
-    outputs:
-      generatedFaces:
-        type: dataset
-        with:
-          ref: dsd0htw9jx5bkwv
-    uses: script@v1
-    with:
-      script: |-
-        pip install scipy==1.3.3
-        pip install requests==2.22.0
-        pip install Pillow==6.2.1
-        cd /inputs/repo
-        python run_generator.py generate-images \
-          --network=gdrive:networks/stylegan2-ffhq-config-f.pkl \
-          --seeds=6600-6605 \
-          --truncation-psi=0.5 \
-          --result-dir=/outputs/generatedFaces
-      image: tensorflow/tensorflow:1.14.0-gpu-py3
+  - name: train
+    image: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+    machine: A100-40G   # Pick a machine your account has access to (e.g., A100-40G, A5000, P5000, C10)
+
+    # Environment variables: tweak these or set via UI. Secrets are referenced via ${secrets.NAME}
+    env:
+      MONGO_URI: ${secrets.MONGO_URI}
+      MONGO_DB: PriceForecast
+      COLL_STOCK: DailyStockData
+      COLL_CRYPTO: DailyCryptoData
+      COLL_FX: DailyCurrencyExchangeRates
+      COLL_NEWS: NewsHeadlines
+      COLL_WEATHER: DailyWeatherData
+      COLL_PRED: PricePredictions
+
+      # Modeling knobs
+      LOOKBACK: "180"
+      HORIZONS_TD: "5,21,126,252"     # 1m, 6m, 1y in trading days
+      HORIZONS_CAL: "7,30,182,365"    # 1m, 6m, 1y in calendar days
+      USE_TRADING_DAYS: "true"      # set to "false" to use calendar horizons
+
+      # Quantiles (optional)
+      USE_QUANTILES: "true"         # "true" → p50/p90; "false" → point estimates
+      QUANTILES: "0.5,0.9"
+
+      # Weather settings
+      WEATHER_PCA: "12"
+      WEATHER_AGG: "mean"           # mean | median
+      FOLD_AWARE_WEATHER_PCA: "false"  # set "true" if using walk-forward and you want fold-aware PCA
+
+      # Training config
+      WALK_FORWARD: "true"
+      TRAIN_SPAN_DAYS: "1095"       # 3 years
+      VAL_SPAN_DAYS: "90"
+      STEP_DAYS: "90"
+      BATCH: "256"
+      EPOCHS: "15"
+      LR: "0.0007"
+      DROPOUT: "0.15"
+      LAYERS: "2"
+      HIDDEN: "128"
+      WEIGHT_DECAY: "0.0001"
+
+      # Output
+      TOP_K: "20"
+      RANK_HORIZON: "1y"           # one of {1m,6m,1y}
+      RANK_QUANTILE: "0.5"         # used when USE_QUANTILES=true
+      ARTIFACTS_DIR: "artifacts"
+
+    commands:
+      - pip install -r requirements.txt
+      # If you saved the script under a different name (e.g., train.py), update the line below.
+      - python training.py
+
+#schedules:
+  # Weekly retrain: Mondays 02:00 UTC
+#  - cron: "0 2 * * 1"
+#    job: train
+
+secrets:
+  # Add this secret in the Gradient UI → Project → Secrets
+  - name: MONGO_URI
