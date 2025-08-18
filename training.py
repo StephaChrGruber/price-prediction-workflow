@@ -342,6 +342,7 @@ def transform_weather_pca(weather_daily: pd.DataFrame, pca, sc, wx_cols: List[st
 
 
 def merge_weather(panel: pd.DataFrame, weather_daily: pd.DataFrame, n_components: int, fit_dates: Optional[List[pd.Timestamp]] = None):
+    weather_daily = weather_daily.fillna(0.0)
     if weather_daily.empty:
         names = [f"wx_pca_{i}" for i in range(n_components)]
         for n in names: panel[n] = 0.0
