@@ -32,10 +32,13 @@ Artifacts are saved in ./artifacts/ (weights + scaler + feature list).
 
 """
 from __future__ import annotations
+
+import logging
 import os
 import copy
 import math
 import argparse
+import sys
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
@@ -51,6 +54,15 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import joblib
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(name)-20s] %(asctime)s [%(levelname)-6s]: %(message)s",
+    stream=sys.stdout,
+    force=True
+)
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------
 # Utils
@@ -605,11 +617,11 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
                 x, m, a, y = x.to(device), m.to(device), a.to(device), y.to(device)
                 vl += loss_fn(model(x, a, m), y).item() * len(y)
         vl /= len(va_dl.dataset)
-        print(f"Train {tl:.5f} | Val {vl:.5f}")
+        logger.info(f"Train {tl:.5f} | Val {vl:.5f}")
         if vl < best_val - 1e-4: best_val, best_state, bad = vl, copy.deepcopy(model.state_dict()), 0
         else:
             bad += 1
-            if bad > patience: print("Early stop."); break
+            if bad > patience: logger.info("Early stop."); break
     model.load_state_dict(best_state)
     return model, best_val
 
@@ -632,11 +644,11 @@ def train_quant(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
                 x, m, a, y = x.to(device), m.to(device), a.to(device), y.to(device)
                 vl += pinball_loss_multi(model(x, a, m), y, Q).item() * len(y)
         vl /= len(va_dl.dataset)
-        print(f"[Q] Train {tl:.5f} | Val {vl:.5f}")
+        logger.info(f"[Q] Train {tl:.5f} | Val {vl:.5f}")
         if vl < best_val - 1e-4: best_val, best_state, bad = vl, copy.deepcopy(model.state_dict()), 0
         else:
             bad += 1
-            if bad > patience: print("Early stop."); break
+            if bad > patience: logger.info("Early stop."); break
     model.load_state_dict(best_state)
     return model, best_val
 
@@ -694,14 +706,14 @@ def persist_topk_to_mongo(pred_df, mongo_uri, dbname, coll_pred, top_k):
     out = pred_df.head(top_k).copy(); out["as_of"] = as_of
     if len(out):
         cli[dbname][coll_pred].insert_many(out.to_dict(orient="records"))
-        print(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
+        logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
 
 
 def save_artifacts(model, scaler, asset2id, FEATURES, outdir="artifacts"):
     os.makedirs(outdir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(outdir, "model.pt"))
     joblib.dump({"scaler": scaler, "asset2id": asset2id, "features": FEATURES}, os.path.join(outdir, "prep.joblib"))
-    print(f"Saved artifacts → {outdir}")
+    logger.info(f"Saved artifacts → {outdir}")
 
 # ---------------------------
 # CLI & main
@@ -760,7 +772,7 @@ def parse_args():
 def main(args):
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Device:", device)
+    logger.info("Device:", device)
 
     # Horizons & labels
     cal = [int(x) for x in args.horizons_cal.split(",") if x]
@@ -769,20 +781,20 @@ def main(args):
         HORIZONS = td;  HLAB = {5: "1w", 21: "1m", 126: "6m", 252: "1y"}
     else:
         HORIZONS = cal; HLAB = {7: "1w", 30: "1m", 182: "6m", 365: "1y"}
-    print("Loading data; connecting to MongoDB")
+    logger.info("Loading data; connecting to MongoDB")
     # Load collections
     cli = mongo_client(args.mongo_uri); db = cli[args.db]
-    print("Loading stock data")
+    logger.info("Loading stock data")
     stock  = _load_coll(db, args.coll_stock)
-    print("Loading crypto data")
+    logger.info("Loading crypto data")
     crypto = _load_coll(db, args.coll_crypto)
-    print("Loading fx data")
+    logger.info("Loading fx data")
     fx     = _load_coll(db, args.coll_fx)
-    print("Loading news data")
+    logger.info("Loading news data")
     news   = _load_coll(db, args.coll_news)
-    print("Loading weather data")
+    logger.info("Loading weather data")
     wxraw  = _load_coll(db, args.coll_weather)
-    print("Preparing panel")
+    logger.info("Preparing panel")
     # Build panel (prices + fx + global news)
     panel, asset2id = prepare_panel(stock, crypto, fx, news)
 
@@ -792,7 +804,7 @@ def main(args):
     else:
         panel, TARGET_COLS, MASK_COLS = add_calendar_targets(panel, HORIZONS)
 
-    print("Preparing weather data")
+    logger.info("Preparing weather data")
     # Weather
     wx_daily = prep_weather_daily(wxraw, agg=args.weather_agg)
 
@@ -831,7 +843,7 @@ def main(args):
                 pred_df = score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device)
                 rank_col = f"pred_{args.rank_horizon}_logret"
             pred_df = pred_df.sort_values(rank_col, ascending=False)
-            print(pred_df.head(20))
+            logger.info(pred_df.head(20))
             persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
             save_artifacts(model, scaler, asset2id, FEATURES)
             return
@@ -839,7 +851,7 @@ def main(args):
             # walk-forward (global weather factors)
             metrics = []
             for i, (tr_idx, va_idx) in enumerate(walk_forward_splits(D, args.train_span_days, args.val_span_days, args.step_days), 1):
-                print(f"Fold {i}: train={len(tr_idx)} val={len(va_idx)}")
+                logger.info(f"Fold {i}: train={len(tr_idx)} val={len(va_idx)}")
                 scaler = fit_scaler_on_train(X_raw[tr_idx])
                 Xtr, Xva = apply_scaler(X_raw[tr_idx], scaler), apply_scaler(X_raw[va_idx], scaler)
                 tr_ds, va_ds = SeqDS(Xtr, M[tr_idx], A[tr_idx], Y[tr_idx]), SeqDS(Xva, M[va_idx], A[va_idx], Y[va_idx])
@@ -854,7 +866,7 @@ def main(args):
                     model = PriceForecastMulti(n_features=Xtr.shape[-1], n_assets=len(asset2id), out_dim=H, hidden=args.hidden, layers=args.layers, dropout=args.dropout)
                     model, best = train_point(model, tr_dl, va_dl, device=device, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay)
                 metrics.append(best)
-            print("Walk-forward val losses:", metrics)
+            logger.info("Walk-forward val losses:", metrics)
             # score using last fold's scaler/model
             if args.use_quantiles:
                 pred_df = score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device)
@@ -863,7 +875,7 @@ def main(args):
                 pred_df = score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device)
                 rank_col = f"pred_{args.rank_horizon}_logret"
             pred_df = pred_df.sort_values(rank_col, ascending=False)
-            print(pred_df.head(20))
+            logger.info(pred_df.head(20))
             persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
             save_artifacts(model, scaler, asset2id, FEATURES)
             return
@@ -881,7 +893,7 @@ def main(args):
         H = len(HORIZONS)
         if args.use_quantiles: QUANTS = [float(x) for x in args.quantiles.split(",") if x]
         for i, (tr_idx, va_idx) in enumerate(walk_forward_splits(Db, args.train_span_days, args.val_span_days, args.step_days), 1):
-            print(f"Fold {i}: train={len(tr_idx)} val={len(va_idx)}")
+            logger.info(f"Fold {i}: train={len(tr_idx)} val={len(va_idx)}")
             train_dates = pd.to_datetime(Db[tr_idx]).unique()
             panel_wx, _, _, _ = merge_weather(panel.copy(), wx_daily, n_components=args.weather_pca, fit_dates=train_dates)
             wx_cols = [c for c in panel_wx.columns if c.startswith("wx_pca_")]
@@ -900,7 +912,7 @@ def main(args):
             else:
                 model = PriceForecastMulti(n_features=Xtr.shape[-1], n_assets=len(asset2id), out_dim=H, hidden=args.hidden, layers=args.layers, dropout=args.dropout)
                 model, best = train_point(model, tr_dl, va_dl, device=device, epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay)
-            print(f"Fold {i} best val: {best:.6f}")
+            logger.info(f"Fold {i} best val: {best:.6f}")
             models.append(model); scalers.append(scaler)
         # score with last fold artifacts
         model, scaler = models[-1], scalers[-1]
@@ -908,14 +920,14 @@ def main(args):
                    score_point(panel_wx, FEATURES, scaler, model, HORIZONS, HLAB, device)
         rank_col = (f"pred_{args.rank_horizon}_p{int(args.rank_quantile*100)}_logret" if args.use_quantiles else f"pred_{args.rank_horizon}_logret")
         pred_df = pred_df.sort_values(rank_col, ascending=False)
-        print(pred_df.head(20))
+        logger.info(pred_df.head(20))
         persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
         save_artifacts(model, scaler, asset2id, FEATURES)
         return
 
 
 if __name__ == "__main__":
-    print("Starting training; parsing args")
+    logger.info("Starting training; parsing args")
     args = parse_args()
-    print("Starting main")
+    logger.info("Starting main")
     main(args)
