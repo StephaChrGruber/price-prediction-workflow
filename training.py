@@ -768,15 +768,20 @@ def main(args):
         HORIZONS = td;  HLAB = {5: "1w", 21: "1m", 126: "6m", 252: "1y"}
     else:
         HORIZONS = cal; HLAB = {7: "1w", 30: "1m", 182: "6m", 365: "1y"}
-
+    print("Loading data; connecting to MongoDB")
     # Load collections
     cli = mongo_client(args.mongo_uri); db = cli[args.db]
+    print("Loading stock data")
     stock  = _load_coll(db, args.coll_stock)
+    print("Loading crypto data")
     crypto = _load_coll(db, args.coll_crypto)
+    print("Loading fx data")
     fx     = _load_coll(db, args.coll_fx)
+    print("Loading news data")
     news   = _load_coll(db, args.coll_news)
+    print("Loading weather data")
     wxraw  = _load_coll(db, args.coll_weather)
-
+    print("Preparing panel")
     # Build panel (prices + fx + global news)
     panel, asset2id = prepare_panel(stock, crypto, fx, news)
 
@@ -786,6 +791,7 @@ def main(args):
     else:
         panel, TARGET_COLS, MASK_COLS = add_calendar_targets(panel, HORIZONS)
 
+    print("Preparing weather data")
     # Weather
     wx_daily = prep_weather_daily(wxraw, agg=args.weather_agg)
 
@@ -908,5 +914,7 @@ def main(args):
 
 
 if __name__ == "__main__":
+    print("Starting training; parsing args")
     args = parse_args()
+    print("Starting main")
     main(args)
