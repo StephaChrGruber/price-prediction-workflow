@@ -79,7 +79,3 @@ jobs:
   # Weekly retrain: Mondays 02:00 UTC
 #  - cron: "0 2 * * 1"
 #    job: train
-
-secrets:
-  # Add this secret in the Gradient UI → Project → Secrets
-  - name: MONGO_URI
