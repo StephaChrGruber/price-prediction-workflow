@@ -74,6 +74,7 @@ jobs:
     uses: script@v1
     with:
       script: |-
+        cd /inputs/repo
         pip install -r requirements.txt
       # If you saved the script under a different name (e.g., train.py), update the line below.
         python training.py
