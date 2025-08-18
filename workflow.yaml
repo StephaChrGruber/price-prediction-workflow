@@ -50,7 +50,7 @@ jobs:
       FOLD_AWARE_WEATHER_PCA: "false"  # set "true" if using walk-forward and you want fold-aware PCA
 
       # Training config
-      WALK_FORWARD: "true"
+      WALK_FORWARD: "false"
       TRAIN_SPAN_DAYS: "1095"       # 3 years
       VAL_SPAN_DAYS: "90"
       STEP_DAYS: "90"

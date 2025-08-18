@@ -705,7 +705,7 @@ def parse_args():
     p.add_argument("--coll-fx", default=os.getenv("COLL_FX", "DailyCurrencyExchangeRates"))
     p.add_argument("--coll-news", default=os.getenv("COLL_NEWS", "NewsHeadlines"))
     p.add_argument("--coll-weather", default=os.getenv("COLL_WEATHER", "DailyWeatherData"))
-    p.add_argument("--coll-pred", default=os.getenv("COLL_PRED", "Predictions"))
+    p.add_argument("--coll-pred", default=os.getenv("COLL_PRED", "PricePredictions"))
     # Horizons
     p.add_argument("--use-trading-days", action="store_true", default=os.getenv("USE_TRADING_DAYS", "false").lower()=="true")
     p.add_argument("--horizons-cal", type=str, default=os.getenv("HORIZONS_CAL", "7,30,182,365"))
@@ -836,6 +836,7 @@ def main(args):
         else:
             logger.info("Walking Forward")
             metrics = []
+            pred_df = pd.DataFrame()
             for i, (tr_idx, va_idx) in enumerate(walk_forward_splits(D, args.train_span_days, args.val_span_days, args.step_days), 1):
                 logger.info(f"\n[fold {i}] train={len(tr_idx)} val={len(va_idx)}")
                 scaler = fit_scaler_on_train(X_raw[tr_idx])
@@ -855,15 +856,15 @@ def main(args):
                 logger.info(f"[walk-forward] val losses: {metrics}")
 
                 if args.use_quantiles:
-                    pred_df = score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device)
+                    pred_df = pd.concat([pred_df, score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device)])
                     rank_col = f"pred_{args.rank_horizon}_p{int(args.rank_quantile*100)}_logret"
                 else:
-                    pred_df = score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device)
+                    pred_df = pd.concat([pred_df, score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device)])
                     rank_col = f"pred_{args.rank_horizon}_logret"
                 pred_df = pred_df.sort_values(rank_col, ascending=False)
-                logger.info(pred_df.head(20))
-                persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
-                save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
+                logger.info(f"\n{pred_df.head(20)}")
+            persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
+            save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
             return
     else:
         # fold-aware weather PCA
