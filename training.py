@@ -685,7 +685,7 @@ def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
 def persist_topk_to_mongo(pred_df: DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="artifacts"):
     os.makedirs(outdir, exist_ok=True)
     pred_df.to_json(
-        os.patj.join(outdir, "predictions.json"),
+        os.path.join(outdir, "predictions.json"),
         orient="records",
         indent=2,
         force_ascii=False,  # keep unicode
