@@ -146,26 +146,38 @@ def prep_crypto(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prep_fx(df: pd.DataFrame) -> pd.DataFrame:
-    """DailyCurrencyExchangeRates: date, base_currency, dynamic currency codes (USD, JPY...).
-    Produces daily mean EUR FX log return across the dynamic columns.
+    """
+    DailyCurrencyExchangeRates: date, base_currency, dynamic currency codes (USD, JPY, ...).
+    Returns a 2-col frame: [date, eur_fx_logret] with the mean daily EUR log return across all rate columns.
+    Vectorized to avoid DataFrame fragmentation warnings.
     """
     if df.empty:
         return df
+
     d = df.copy()
     d[TIME_COL] = to_dt(d.get(TIME_COL, pd.Series(index=d.index)))
     d = d.dropna(subset=[TIME_COL]).sort_values(TIME_COL)
+
+    # Dynamic rate columns = all except date/base_currency
     rate_cols = [c for c in d.columns if c not in {TIME_COL, "base_currency"}]
     if not rate_cols:
-        return pd.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": np.zeros(len(d))})
-    for c in rate_cols:
-        d[c] = pd.to_numeric(d[c], errors="coerce").ffill().bfill().fillna(1.0).clip(lower=EPS)
-    for c in rate_cols:
-        v = d[c].values.astype(float)
-        d[f"lr_{c}"] = np.r_[0.0, np.diff(safe_log(v))]
-    lr_cols = [f"lr_{c}" for c in rate_cols]
-    out = d[[TIME_COL] + lr_cols].copy()
-    out["eur_fx_logret"] = out[lr_cols].mean(axis=1, skipna=True).fillna(0.0)
-    return out[[TIME_COL, "eur_fx_logret"]]
+        return pd.DataFrame({TIME_COL: d[TIME_COL].values, "eur_fx_logret": np.zeros(len(d), dtype=float)})
+
+    # Clean & clip all rate columns in one shot
+    rates = d[rate_cols].apply(pd.to_numeric, errors="coerce").ffill().bfill().fillna(1.0)
+    rates = rates.clip(lower=EPS)  # avoid log(0)
+
+    # Vectorized log-returns for all columns
+    log_rates = np.log(rates.to_numpy(dtype=float))                # shape: (T, N)
+    dlog = np.diff(log_rates, axis=0)                              # shape: (T-1, N)
+    dlog = np.vstack([np.zeros((1, dlog.shape[1]), dtype=float),   # prepend 0 for first row
+                      dlog])
+
+    # Mean across currencies per day
+    eur_fx_logret = np.nanmean(dlog, axis=1)
+    eur_fx_logret = np.where(np.isfinite(eur_fx_logret), eur_fx_logret, 0.0)
+
+    return pd.DataFrame({TIME_COL: d[TIME_COL].values, "eur_fx_logret": eur_fx_logret})
 
 
 def _extract_sentiment(val) -> float:
@@ -403,6 +415,11 @@ def build_sequences_multi(panel: pd.DataFrame, lookback: int, features: List[str
                 if not np.isfinite(y).any(): continue
             win = g.iloc[t-lookback:t]
             if len(win) < lookback: continue
+
+            mask_win = win["is_trading_day"].values.astype(bool)
+            if not mask_win.any():
+                continue
+
             X.append(win[features].values.astype(np.float32))
             M.append(win["is_trading_day"].values.astype(bool))
             A.append(int(win["asset_id"].iloc[-1]))
@@ -447,12 +464,36 @@ def apply_scaler(X: np.ndarray, sc: StandardScaler) -> np.ndarray:
 # Models & training
 # ==========================
 class AttentionPool(nn.Module):
-    def __init__(self, d):
-        super().__init__(); self.attn = nn.Linear(d, 1)
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.attn = nn.Linear(d_model, 1)
+
     def forward(self, x, mask=None):
-        s = self.attn(x).squeeze(-1)
-        if mask is not None: s = s.masked_fill(~mask.bool(), float('-inf'))
-        w = torch.softmax(s, dim=-1).unsqueeze(-1); return (x * w).sum(1), w.squeeze(-1)
+        # x: [B, T, D], mask: [B, T] bool
+        scores = self.attn(x).squeeze(-1)           # [B, T]
+
+        if mask is None:
+            w = torch.softmax(scores, dim=1)        # [B, T]
+        else:
+            mask = mask.bool()
+            # Large negative for masked positions; will zero after softmax
+            scores = scores.masked_fill(~mask, -1e9)
+            w = torch.softmax(scores, dim=1)
+
+            # Zero weights where masked, then renormalize
+            w = w * mask.float()
+            denom = w.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+            # If a row is fully masked, fallback to uniform over all timesteps
+            all_false = (~mask).all(dim=1)
+            if all_false.any():
+                w[all_false] = 1.0 / x.size(1)
+
+            w = w / denom
+
+        pooled = (x * w.unsqueeze(-1)).sum(dim=1)   # [B, D]
+        return pooled, w
+
 
 class PriceForecastMulti(nn.Module):
     def __init__(self, n_features, n_assets, out_dim, hidden=128, layers=2, dropout=0.15, emb_dim=32):
@@ -632,9 +673,9 @@ def parse_args():
     p.add_argument("--coll-weather", default=os.getenv("COLL_WEATHER", "DailyWeatherData"))
     p.add_argument("--coll-pred", default=os.getenv("COLL_PRED", "Predictions"))
     # Horizons
-    p.add_argument("--use-trading-days", action="store_true", default=os.getenv("USE_TRADING_DAYS", "true").lower()=="true")
-    p.add_argument("--horizons-cal", type=str, default=os.getenv("HORIZONS_CAL", "30,182,365"))
-    p.add_argument("--horizons-td", type=str, default=os.getenv("HORIZONS_TD", "21,126,252"))
+    p.add_argument("--use-trading-days", action="store_true", default=os.getenv("USE_TRADING_DAYS", "false").lower()=="true")
+    p.add_argument("--horizons-cal", type=str, default=os.getenv("HORIZONS_CAL", "7,30,182,365"))
+    p.add_argument("--horizons-td", type=str, default=os.getenv("HORIZONS_TD", "5,21,126,252"))
     # Weather
     p.add_argument("--weather-pca", type=int, default=int(os.getenv("WEATHER_PCA", 12)))
     p.add_argument("--weather-agg", type=str, choices=["mean","median"], default=os.getenv("WEATHER_AGG", "mean"))
@@ -686,9 +727,9 @@ def main(args):
     cal = [int(x) for x in args.horizons_cal.split(",") if x]
     td  = [int(x) for x in args.horizons_td.split(",") if x]
     if args.use_trading_days:
-        HORIZONS = td;  HLAB = {21:"1m",126:"6m",252:"1y"}
+        HORIZONS = td;  HLAB = {5:"1w", 21:"1m",126:"6m",252:"1y"}
     else:
-        HORIZONS = cal; HLAB = {30:"1m",182:"6m",365:"1y"}
+        HORIZONS = cal; HLAB = {7: "1w", 30:"1m",182:"6m",365:"1y"}
 
     cli = mongo_client(args.mongo_uri); db = cli[args.db]
     stock  = _load_coll(db, args.coll_stock)
