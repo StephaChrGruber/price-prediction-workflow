@@ -84,9 +84,9 @@ def mongo_client(uri: str) -> MongoClient:
 
 def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
     if not proj:
-        docs = list(db[name].find({}).limit(1000))
+        docs = list(db[name].find({}).limit(100000))
     else:
-        docs = list(db[name].find({}, proj).limit(1000))
+        docs = list(db[name].find({}, proj).limit(100000))
     if not docs:
         return pd.DataFrame()
     df = pd.DataFrame(docs)
@@ -767,17 +767,18 @@ def main(args):
                     model = PriceForecastMulti(Xtr.shape[-1], len(asset2id), H, args.hidden, args.layers, args.dropout)
                     model, best = train_point(model, tr_dl, va_dl, device, args.epochs, args.lr, args.weight_decay)
                 metrics.append(best)
-            logger.info(f"[walk-forward] val losses: {metrics}")
-            if args.use_quantiles:
-                pred_df = score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device)
-                rank_col = f"pred_{args.rank_horizon}_p{int(args.rank_quantile*100)}_logret"
-            else:
-                pred_df = score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device)
-                rank_col = f"pred_{args.rank_horizon}_logret"
-            pred_df = pred_df.sort_values(rank_col, ascending=False)
-            logger.info(pred_df.head(20))
-            persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
-            save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
+                logger.info(f"[walk-forward] val losses: {metrics}")
+
+                if args.use_quantiles:
+                    pred_df = score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device)
+                    rank_col = f"pred_{args.rank_horizon}_p{int(args.rank_quantile*100)}_logret"
+                else:
+                    pred_df = score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device)
+                    rank_col = f"pred_{args.rank_horizon}_logret"
+                pred_df = pred_df.sort_values(rank_col, ascending=False)
+                logger.info(pred_df.head(20))
+                persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
+                save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
             return
     else:
         # fold-aware weather PCA
