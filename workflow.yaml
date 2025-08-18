@@ -2,9 +2,6 @@
 # Save this file as `workspace.yaml` at the root of your repo/project.
 # If you're uploading files directly to a Gradient Project (not using Git),
 # you can remove the `workspace.repo` block.
-
-name: price-forecast-workspace
-
 jobs:
   CloneRepo:
     resources:
