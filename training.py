@@ -772,7 +772,7 @@ def parse_args():
 def main(args):
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("Device:", device)
+    logger.info(f"Device: {device}")
 
     # Horizons & labels
     cal = [int(x) for x in args.horizons_cal.split(",") if x]
