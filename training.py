@@ -33,6 +33,8 @@ except Exception as e:
     print("[boot][FATAL] torch import failed:", e)
     raise
 
+
+
 import os
 import copy
 import argparse
@@ -87,9 +89,9 @@ def mongo_client(uri: str) -> MongoClient:
 
 def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
     if not proj:
-        cur = db[name].find({}).limit(1000)
+        cur = db[name].find({})
     else:
-        cur = db[name].find({}, proj).limit(1000)
+        cur = db[name].find({}, proj)
     if not cur:
         return pd.DataFrame()
 
@@ -682,18 +684,12 @@ def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
     return pd.DataFrame(rows)
 
 
-def persist_topk_to_mongo(pred_df: DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="artifacts"):
+def persist_topk_to_mongo(pred_df: DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="outputs"):
     os.makedirs(outdir, exist_ok=True)
-    pred_df.to_json(
-        os.path.join(outdir, "predictions.json"),
-        orient="records",
-        indent=2,
-        force_ascii=False,  # keep unicode
-        date_format="iso",  # 2025-08-18T00:00:00.000Z
-    )
-    #cli = mongo_client(mongo_uri); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
-    #out = pred_df.head(top_k).copy(); out["as_of"]=as_of
-    #if len(out): cli[dbname][coll_pred].insert_many(out.to_dict(orient="records")); logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
+    logger.info(pred_df.to_json())
+    cli = mongo_client(mongo_uri); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    out = pred_df.head(top_k).copy(); out["as_of"]=as_of
+    if len(out): cli[dbname][coll_pred].insert_many(out.to_dict(orient="records")); logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
 
 
 def save_artifacts(model, scaler, asset2id, FEATURES, outdir="artifacts"):
@@ -752,7 +748,7 @@ def parse_args():
     p.add_argument("--rank-horizon", type=str, default=os.getenv("RANK_HORIZON", "1y"))
     p.add_argument("--rank-quantile", type=float, default=float(os.getenv("RANK_QUANTILE", 0.5)))
     # Artifacts
-    p.add_argument("--artifacts-dir", type=str, default=os.getenv("ARTIFACTS_DIR", "artifacts"))
+    p.add_argument("--artifacts-dir", type=str, default=os.getenv("ARTIFACTS_DIR", "outputs"))
     return p.parse_args()
 
 
