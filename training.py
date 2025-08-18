@@ -31,7 +31,6 @@ Default collection names match your schemas:
 Artifacts are saved in ./artifacts/ (weights + scaler + feature list).
 
 """
-from __future__ import annotations
 import os
 import copy
 import math
