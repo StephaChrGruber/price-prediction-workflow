@@ -927,7 +927,10 @@ def main(args):
 
 
 if __name__ == "__main__":
-    logger.info("Starting training; parsing args")
-    args = parse_args()
-    logger.info("Starting main")
-    main(args)
+    try:
+        logger.info("Starting training; parsing args")
+        args = parse_args()
+        logger.info("Starting main")
+        main(args)
+    except Exception as e:
+        logger.error(e)
