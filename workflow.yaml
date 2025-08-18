@@ -23,7 +23,7 @@ jobs:
       generatedPrices:
         type: dataset
         with:
-          ref: dsd0htw9jx5bkwv
+          ref: dsdazko82wby9he
     env:
       MONGO_URI: "mongodb://admin:2059$tephan5203@94.130.171.244:27017/?authSource=admin&readPreference=secondaryPreferred&directConnection=true"
       MONGO_DB: PriceForecast
