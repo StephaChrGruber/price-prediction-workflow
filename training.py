@@ -265,10 +265,11 @@ def prepare_panel(stock_df, crypto_df, fx_df, news_df) -> Tuple[pd.DataFrame, Di
         for col in ["volume","quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol"]:
             g[col] = g[col] * g["is_trading_day"].fillna(0)
         # Technicals (safe)
-        logc = safe_log(g["close"].values)
+        logc = safe_log(g["close"].to_numpy())
         g["logret_1d"] = np.diff(logc, prepend=logc[0])
-        g["vol_20d"]   = pd.Series(g["logret_1d"]).rolling(20, min_periods=1).std().values
-        g["mom_63d"]   = logc - np.roll(logc, 63); g.loc[:62, "mom_63d"] = 0.0
+        g["vol_20d"] = pd.Series(g["logret_1d"], index=g.index).rolling(20, min_periods=1).std().fillna(0.0).to_numpy()
+        g["mom_63d"] = logc - np.roll(logc, 63)
+        g.iloc[:63, g.columns.get_loc("mom_63d")] = 0.0
         g["hl_spread"] = ((g["high"] - g["low"]) / np.maximum(g["close"], EPS)).astype(float)
         # Restore ids
         g[SYMBOL_COL] = sym; g[TIME_COL] = g.index
