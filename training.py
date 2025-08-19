@@ -553,8 +553,8 @@ def prep_weather_daily(weather_df: pd.DataFrame, agg: str = "mean") -> pd.DataFr
     logger.info("Grouping Weather")
     if agg == "median": wagg = w.groupby(TIME_COL)[wx_num].median().reset_index()
     else: wagg = w.groupby(TIME_COL)[wx_num].mean().reset_index()
-    logger.info("Sorting Weather")
-    wagg = wagg.sort_values(TIME_COL).rename(columns={c: f"wx_{c}" for c in wx_num})
+    logger.info("Renaming Weather columns")
+    wagg = wagg.rename(columns={c: f"wx_{c}" for c in wx_num})
     return wagg
 
 
