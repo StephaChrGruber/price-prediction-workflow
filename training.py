@@ -24,6 +24,8 @@ import os, sys, time, signal, threading
 
 # 1) Always print tracebacks on crashes/timeouts
 import faulthandler;
+from asyncio import as_completed
+from concurrent.futures import ProcessPoolExecutor, wait
 from datetime import datetime, timedelta
 
 faulthandler.enable()
@@ -459,6 +461,7 @@ def prep_news_global(df: pd.DataFrame, pca_cap: int = 32) -> pd.DataFrame:
 
     rows = []
     for dt, g in d.groupby(TIME_COL):
+        logger.info(f"Preparing news data for date: {dt}")
         sent_mean = float(np.nanmean(g["sentiment_scalar"].values)) if len(g) else 0.0
         sent_max  = float(np.nanmax(g["sentiment_scalar"].values)) if len(g) else 0.0
         cnt = int(len(g))
@@ -512,75 +515,7 @@ def prepare_panel(stock_df, crypto_df, fx_df, news_df) -> Tuple[pd.DataFrame, Di
     prices = pd.concat([s, c], ignore_index=True)
 
     cal = daily_calendar(prices)
-    rows = []
-
-    def reduce_daily_duplicates(g: pd.DataFrame) -> pd.DataFrame:
-        """
-        Collapse duplicate rows that share the same `date` within a symbol group.
-        Uses OHLC-type rules; any other numeric columns default to 'last'.
-        """
-        g = g.copy()
-        g = g.sort_values(TIME_COL).dropna(subset=[TIME_COL])
-
-        # Build a dynamic aggregation map
-        rules = {
-            "open": "first",  # first print of the day
-            "high": "max",
-            "low": "min",
-            "close": "last",  # last print of the day
-            "volume": "sum",
-            "quote_asset_volume": "sum",
-            "num_trades": "sum",
-            "taker_buy_base_vol": "sum",
-            "taker_buy_quote_vol": "sum",
-            "closePctChange": "last",
-            "openPctChange": "last",
-        }
-        # Any other numeric columns → take last
-        num_cols = g.select_dtypes(include=[np.number]).columns.tolist()
-        for c in num_cols:
-            rules.setdefault(c, "last")
-
-        # If there are duplicates on TIME_COL, aggregate; else return as-is
-        if g[TIME_COL].duplicated().any():
-            # Keep only columns we can aggregate
-            cols = [TIME_COL] + [c for c in g.columns if c in rules]
-            agg = g[cols].groupby(TIME_COL, as_index=False).agg({c: rules[c] for c in cols if c != TIME_COL})
-            return agg
-        else:
-            return g
-
-    for sym, g in prices.groupby(SYMBOL_COL):
-        logger.info(f"Reducing duplicates for {sym}")
-        g = reduce_daily_duplicates(g)
-
-
-        g = g.set_index(TIME_COL).reindex(cal)
-        g["is_trading_day"] = g["close"].notna().astype(int)
-        logger.info(f"Clamping prices for {sym}")
-        # Fill and clamp prices
-        for col in ["close","open","high","low"]:
-            g[col] = pd.to_numeric(g.get(col, np.nan), errors="coerce").ffill().bfill().fillna(0.0).clip(lower=EPS)
-        # Activity features (0 on non-trading days)
-        logger.info(f"Creating activity features for {sym}")
-        for col in ["volume","quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol","closePctChange","openPctChange"]:
-            g[col] = pd.to_numeric(g.get(col, 0.0), errors="coerce").fillna(0.0)
-        for col in ["volume","quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol"]:
-            g[col] = g[col] * g["is_trading_day"].fillna(0)
-        # Technicals (safe)
-        logger.info(f"Calculating training values for {sym}")
-        logc = safe_log(g["close"].to_numpy())
-        g["logret_1d"] = np.diff(logc, prepend=logc[0])
-        g["vol_20d"] = pd.Series(g["logret_1d"], index=g.index).rolling(20, min_periods=1).std().fillna(0.0).to_numpy()
-        g["mom_63d"] = logc - np.roll(logc, 63)
-        g.iloc[:63, g.columns.get_loc("mom_63d")] = 0.0
-        g["hl_spread"] = ((g["high"] - g["low"]) / np.maximum(g["close"], EPS)).astype(float)
-        # Restore ids
-        g[SYMBOL_COL] = sym; g[TIME_COL] = g.index
-        src = prices.loc[prices[SYMBOL_COL]==sym, "source"].iloc[0]
-        g["source"] = src
-        rows.append(g.reset_index(drop=True))
-    panel = pd.concat(rows, ignore_index=True)
+    panel = process_all_symbols_parallel(prices, cal, 8)
 
     # FX merge
     fx_norm = prep_fx(fx_df)
@@ -614,9 +549,11 @@ def prep_weather_daily(weather_df: pd.DataFrame, agg: str = "mean") -> pd.DataFr
     w = weather_df.copy(); w[TIME_COL] = to_dt(w.get(TIME_COL, pd.Series(index=w.index)))
     w = w.dropna(subset=[TIME_COL])
     wx_num = [c for c in ["tavg","tmin","tmax","prcp","snow","wdir","wspd","wpgt","pres","tsun"] if c in w.columns]
-    for c in wx_num: w[c] = pd.to_numeric(w[c], errors="coerce")
+    for c in tqdm(wx_num, desc="WX_Num"): w[c] = pd.to_numeric(w[c], errors="coerce")
+    logger.info("Grouping Weather")
     if agg == "median": wagg = w.groupby(TIME_COL)[wx_num].median().reset_index()
     else: wagg = w.groupby(TIME_COL)[wx_num].mean().reset_index()
+    logger.info("Sorting Weather")
     wagg = wagg.sort_values(TIME_COL).rename(columns={c: f"wx_{c}" for c in wx_num})
     return wagg
 
@@ -1092,6 +1029,113 @@ def quick_nan_report(X, name="X"):
         i = np.where(bad)
         logger.info(f"[WARN] Non-finite in {name}: count={bad.sum()} at first example/t/f={i[0][0]},{i[1][0]},{i[2][0]}")
 
+def reduce_daily_duplicates(g: pd.DataFrame) -> pd.DataFrame:
+    g = g.copy()
+    g = g.sort_values(TIME_COL).dropna(subset=[TIME_COL])
+
+    rules = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+        "quote_asset_volume": "sum",
+        "num_trades": "sum",
+        "taker_buy_base_vol": "sum",
+        "taker_buy_quote_vol": "sum",
+        "closePctChange": "last",
+        "openPctChange": "last",
+    }
+    num_cols = g.select_dtypes(include=[np.number]).columns.tolist()
+    for c in num_cols:
+        rules.setdefault(c, "last")
+
+    if g[TIME_COL].duplicated().any():
+        cols = [TIME_COL] + [c for c in g.columns if c in rules]
+        agg = g[cols].groupby(TIME_COL, as_index=False).agg({c: rules[c] for c in cols if c != TIME_COL})
+        return agg
+    else:
+        return g
+
+# --- the per-symbol worker (MUST be top-level) ---
+def _process_one_symbol(sym: str,
+                        g: pd.DataFrame,
+                        cal: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Returns a processed per-symbol DataFrame; returns empty frame on error.
+    """
+    logger.info(f"Processing {sym}")
+    try:
+        # keep source before reindex drops it
+        src = g["source"].iloc[0] if "source" in g.columns and len(g) else "unknown"
+
+        # 0) collapse duplicate dates
+        g = reduce_daily_duplicates(g)
+
+        # 1) align to full daily calendar
+        g = g.set_index(TIME_COL).reindex(cal)
+
+        # 2) mark trading days
+        g["is_trading_day"] = g["close"].notna().astype(int)
+
+        # 3) fill & clamp prices (safe)
+        for col in ["close", "open", "high", "low"]:
+            g[col] = pd.to_numeric(g.get(col, np.nan), errors="coerce").ffill().bfill().fillna(0.0).clip(lower=EPS)
+
+        # 4) activity features (0 on non-trading days)
+        for col in ["volume","quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol","closePctChange","openPctChange"]:
+            g[col] = pd.to_numeric(g.get(col, 0.0), errors="coerce").fillna(0.0)
+        for col in ["volume","quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol"]:
+            g[col] = g[col] * g["is_trading_day"].fillna(0)
+
+        # 5) technicals (safe)
+        logc = safe_log(g["close"].to_numpy())
+        g["logret_1d"] = np.diff(logc, prepend=logc[0])
+        g["vol_20d"]   = pd.Series(g["logret_1d"], index=g.index).rolling(20, min_periods=1).std().fillna(0.0).to_numpy()
+        g["mom_63d"]   = logc - np.roll(logc, 63)
+        g.iloc[:63, g.columns.get_loc("mom_63d")] = 0.0
+        g["hl_spread"] = ((g["high"] - g["low"]) / np.maximum(g["close"], EPS)).astype(float)
+
+        # 6) restore ids
+        g[SYMBOL_COL] = sym
+        g[TIME_COL]   = g.index
+        g["source"]   = src
+
+        return g.reset_index(drop=True)
+
+    except Exception as e:
+        # If you have a cross-process safe logger, use it; else print
+        print(f"[worker] symbol={sym} failed: {e}", flush=True)
+        return pd.DataFrame(columns=[SYMBOL_COL, TIME_COL])  # empty
+
+# --- orchestrate in parallel ---------------------
+def process_all_symbols_parallel(prices: pd.DataFrame,
+                                 cal: pd.DatetimeIndex,
+                                 max_workers: int | None = None) -> pd.DataFrame:
+    """
+    Parallelize the per-symbol processing with a process pool.
+    """
+    max_workers = max_workers or max(1, (os.cpu_count() or 2) - 1)
+
+    # Build tasks: one (sym, df) per symbol
+    tasks = [(sym, grp.copy()) for sym, grp in prices.groupby(SYMBOL_COL, sort=False)]
+
+    rows = []
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        with ProcessPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(_process_one_symbol, sym, g, cal) for sym, g in tasks]
+            wait(futures)  # <-- blocks until all complete
+            rows = [f.result() for f in futures]  # collect (raises errors if any)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+# -------------------------------------------------
+# Usage inside your prepare_panel(...):
+
+# panel = process_all_symbols_parallel(prices, cal, max_workers=8)
+
 def main(args):
     logger.info("[boot] starting main()")
     set_seed(args.seed)
@@ -1340,7 +1384,6 @@ def main(args):
     else:
         panel, TARGET_COLS, MASK_COLS = add_calendar_targets(panel, HORIZONS)
 
-    logger.info("Preparing weather panel")
     wx_daily = prep_weather_daily(wxraw, agg=args.weather_agg)
 
     if not args.walk_forward or not args.fold_aware_weather_pca:
