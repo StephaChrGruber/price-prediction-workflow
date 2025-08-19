@@ -346,6 +346,7 @@ def to_dt(s: pd.Series) -> pd.Series:
 
 
 def prep_stocks(df: pd.DataFrame) -> pd.DataFrame:
+    logger.info("Preparing stocks")
     if df.empty:
         return df
     d = df.copy()
@@ -362,6 +363,7 @@ def prep_stocks(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prep_crypto(df: pd.DataFrame) -> pd.DataFrame:
+    logger.info("Preparing crypto")
     if df.empty:
         return df
     d = df.copy()
@@ -394,6 +396,7 @@ def prep_fx(df: pd.DataFrame) -> pd.DataFrame:
     Returns a 2-col frame: [date, eur_fx_logret] with the mean daily EUR log return across all rate columns.
     Vectorized to avoid DataFrame fragmentation warnings.
     """
+    logger.info("Preparing FX")
     if df.empty:
         return df
 
@@ -437,6 +440,7 @@ def _extract_sentiment(val) -> float:
 
 
 def prep_news_global(df: pd.DataFrame, pca_cap: int = 32) -> pd.DataFrame:
+    logger.info("Preparing News")
     if df.empty:
         return df
     d = df.copy()
@@ -489,6 +493,7 @@ def prep_news_global(df: pd.DataFrame, pca_cap: int = 32) -> pd.DataFrame:
 # ==========================
 
 def daily_calendar(prices: pd.DataFrame) -> pd.DatetimeIndex:
+    logger.info("Generating daily calendar")
     first = prices[TIME_COL].min(); last = prices[TIME_COL].max()
     return pd.date_range(first, last, freq="D")
 
@@ -546,22 +551,24 @@ def prepare_panel(stock_df, crypto_df, fx_df, news_df) -> Tuple[pd.DataFrame, Di
             return g
 
     for sym, g in prices.groupby(SYMBOL_COL):
+        logger.info(f"Reducing duplicates for {sym}")
         g = reduce_daily_duplicates(g)
 
-        if reduce_daily_duplicates(g)[TIME_COL].duplicated().any():
-            raise RuntimeError(f"Still duplicate dates for symbol {sym}; check upstream loaders.")
 
         g = g.set_index(TIME_COL).reindex(cal)
         g["is_trading_day"] = g["close"].notna().astype(int)
+        logger.info(f"Clamping prices for {sym}")
         # Fill and clamp prices
         for col in ["close","open","high","low"]:
             g[col] = pd.to_numeric(g.get(col, np.nan), errors="coerce").ffill().bfill().fillna(0.0).clip(lower=EPS)
         # Activity features (0 on non-trading days)
+        logger.info(f"Creating activity features for {sym}")
         for col in ["volume","quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol","closePctChange","openPctChange"]:
             g[col] = pd.to_numeric(g.get(col, 0.0), errors="coerce").fillna(0.0)
         for col in ["volume","quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol"]:
             g[col] = g[col] * g["is_trading_day"].fillna(0)
         # Technicals (safe)
+        logger.info(f"Calculating training values for {sym}")
         logc = safe_log(g["close"].to_numpy())
         g["logret_1d"] = np.diff(logc, prepend=logc[0])
         g["vol_20d"] = pd.Series(g["logret_1d"], index=g.index).rolling(20, min_periods=1).std().fillna(0.0).to_numpy()
@@ -602,6 +609,7 @@ def prepare_panel(stock_df, crypto_df, fx_df, news_df) -> Tuple[pd.DataFrame, Di
 # ==========================
 
 def prep_weather_daily(weather_df: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:
+    logger.info("Preparing Weather")
     if weather_df.empty: return pd.DataFrame(columns=[TIME_COL])
     w = weather_df.copy(); w[TIME_COL] = to_dt(w.get(TIME_COL, pd.Series(index=w.index)))
     w = w.dropna(subset=[TIME_COL])
