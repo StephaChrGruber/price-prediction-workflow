@@ -67,6 +67,7 @@ jobs:
       RANK_HORIZON: "1y"           # one of {1m,6m,1y}
       RANK_QUANTILE: "0.5"         # used when USE_QUANTILES=true
       ARTIFACTS_DIR: "outputs"
+      IGNORE_DAYS: 7
     uses: script@v1
     with:
       script: |-
