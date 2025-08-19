@@ -14,7 +14,7 @@ jobs:
       url: https://github.com/StephaChrGruber/price-prediction-workflow.git
   TrainPricePrediction:
     resources:
-      instance-type: P4000
+      instance-type: P5000
     needs:
       - CloneRepo
     inputs:
