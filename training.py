@@ -23,7 +23,10 @@ Run (example):
 import os, sys, time, signal, threading
 
 # 1) Always print tracebacks on crashes/timeouts
-import faulthandler; faulthandler.enable()
+import faulthandler;
+from datetime import datetime, timedelta
+
+faulthandler.enable()
 # Dump stack on SIGTERM or when we poke SIGUSR1
 faulthandler.register(signal.SIGTERM, all_threads=True, chain=False)
 try:
@@ -1069,6 +1072,7 @@ def parse_args():
     p.add_argument("--top-k", type=int, default=int(os.getenv("TOP_K", 20)))
     p.add_argument("--rank-horizon", type=str, default=os.getenv("RANK_HORIZON", "1y"))
     p.add_argument("--rank-quantile", type=float, default=float(os.getenv("RANK_QUANTILE", 0.5)))
+    p.add_argument("--ignore-days", type=int, default=int(os.getenv("IGNORE_DAYS", 0)))
     # Artifacts
     p.add_argument("--artifacts-dir", type=str, default=os.getenv("ARTIFACTS_DIR", "outputs"))
     return p.parse_args()
@@ -1100,6 +1104,7 @@ def main(args):
     def iter_stocks_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
                 db.DailyStockData,
+                query={"date" : {"$lte" : datetime.today().replace(hour = 0, minute = 0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
                 projection={"date": 1, "symbol": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
                 chunk_rows=200_000,
                 start_id=start_id
@@ -1128,6 +1133,8 @@ def main(args):
     def iter_crypto_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
                 db.DailyCryptoData,
+                query={"date": {
+                    "$lte": datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
                 chunk_rows=200_000,
                 start_id=start_id
         ):
@@ -1160,6 +1167,8 @@ def main(args):
     def iter_weather_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
                 db.DailyWeatherData,
+                query={"date": {
+                    "$lte": datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
                 chunk_rows=200_000,
                 start_id=start_id
         ):
@@ -1202,6 +1211,8 @@ def main(args):
     def iter_news_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
                 db.NewsHeadlines,
+                query={"date": {
+                    "$lte": datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
                 projection={"date": 1, "headline": 1, "sentiment": 1, "embeddings": 1},
                 chunk_rows=200_000,
                 start_id=start_id
@@ -1241,6 +1252,8 @@ def main(args):
     def iter_fx_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
                 db.DailyCurrencyExchangeRates,
+                query={"date": {
+                    "$lte": datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
                 chunk_rows=200_000,
                 start_id=start_id
         ):
