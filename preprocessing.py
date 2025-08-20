@@ -10,12 +10,13 @@ from sklearn.preprocessing import StandardScaler
 
 from constants import TIME_COL, SYMBOL_COL, EPS
 from diagnostics import safe_log
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 
 def to_dt(s: pl.Series) -> pl.Series:
-    return s.str.strptime(pl.Datetime, strict=False).dt.replace_time_zone(None)
+    return s.dt.replace_time_zone(None)
 
 
 def prep_stocks(df: pl.DataFrame) -> pl.DataFrame:
@@ -29,7 +30,7 @@ def prep_stocks(df: pl.DataFrame) -> pl.DataFrame:
             d = d.with_columns(pl.lit(np.nan).alias(k))
     d = d.rename({"date": TIME_COL, "symbol": SYMBOL_COL})
     d = d.with_columns([
-        to_dt(pl.col(TIME_COL)),
+        to_dt(d.get_column(TIME_COL)),
         pl.col("open").cast(pl.Float64, strict=False),
         pl.col("close").cast(pl.Float64, strict=False),
         pl.col("high").cast(pl.Float64, strict=False),
@@ -89,20 +90,19 @@ def prep_crypto(df: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-
 def prep_fx(df: pl.DataFrame) -> pl.DataFrame:
     logger.info("Preparing FX")
     if df.is_empty():
         return df
     d = df.clone()
-    d = d.with_columns(to_dt(pl.col(TIME_COL)))
+    d = d.with_columns(d.get_column(TIME_COL))
     d = d.drop_nulls([TIME_COL]).sort(TIME_COL)
     rate_cols = [c for c in d.columns if c not in {TIME_COL, "base_currency"}]
     if not rate_cols:
         return pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": np.zeros(len(d), dtype=float)})
     rates = d.select(rate_cols).with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in rate_cols])
     rates = rates.fill_null(strategy="forward").fill_null(strategy="backward").fill_null(1.0)
-    rates = rates.select([pl.col(c).clip_min(EPS) for c in rate_cols])
+    rates = rates.select([pl.col(c).clip(lower_bound=EPS) for c in rate_cols])
     log_rates = np.log(rates.to_numpy())
     dlog = np.diff(log_rates, axis=0)
     dlog = np.vstack([np.zeros((1, dlog.shape[1]), dtype=float), dlog])
@@ -128,10 +128,10 @@ def prep_news_global(df: pl.DataFrame, pca_cap: int = 32) -> pl.DataFrame:
     if df.is_empty():
         return df
     d = df.clone()
-    d = d.with_columns(to_dt(pl.col(TIME_COL)).dt.truncate("1d"))
+    d = d.with_columns(to_dt(d.get_column(TIME_COL)).dt.truncate("1d"))
     d = d.drop_nulls([TIME_COL])
     if "sentiment" in d.columns:
-        d = d.with_columns(pl.col("sentiment").apply(_extract_sentiment).alias("sentiment_scalar"))
+        d = d.with_columns(pl.col("sentiment").map_elements(_extract_sentiment).alias("sentiment_scalar"))
     else:
         d = d.with_columns(pl.lit(0.0).alias("sentiment_scalar"))
 
@@ -145,11 +145,11 @@ def prep_news_global(df: pl.DataFrame, pca_cap: int = 32) -> pl.DataFrame:
             return np.empty((0,), dtype=float)
 
     if "embeddings" in d.columns:
-        d = d.with_columns(pl.col("embeddings").apply(_to_vec).alias("emb"))
+        d = d.with_columns(pl.col("embeddings").map_elements(_to_vec).alias("emb"))
     else:
         d = d.with_columns(pl.lit(np.empty((0,), dtype=float)).alias("emb"))
 
-    max_dim = max(d["emb"].apply(len).max(), 0)
+    max_dim = max(d["emb"].map_elements(len).max(), 0)
     dim = min(max_dim, pca_cap)
     if dim:
         emb_mat = np.vstack([v[:dim] for v in d["emb"].to_list()])
@@ -168,7 +168,8 @@ def prep_news_global(df: pl.DataFrame, pca_cap: int = 32) -> pl.DataFrame:
     agg_expr.extend(
         [pl.col(f"news_pca_{i}").mean().alias(f"news_pca_{i}") for i in range(dim)]
     )
-    return d.groupby(TIME_COL).agg(agg_expr).sort(TIME_COL)
+
+    return d.group_by(TIME_COL).agg(agg_expr).sort(TIME_COL)
 
 
 def prep_weather_daily(weather_df: pl.DataFrame, agg: str = "mean") -> pl.DataFrame:
@@ -181,9 +182,9 @@ def prep_weather_daily(weather_df: pl.DataFrame, agg: str = "mean") -> pl.DataFr
     wx_num = [c for c in ["tavg", "tmin", "tmax", "prcp", "snow", "wdir", "wspd", "wpgt", "pres", "tsun"] if c in w.columns]
     w = w.with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in wx_num])
     if agg == "median":
-        wagg = w.groupby(TIME_COL).median()
+        wagg = w.group_by(TIME_COL).median()
     else:
-        wagg = w.groupby(TIME_COL).mean()
+        wagg = w.group_by(TIME_COL).mean()
     wagg = wagg.select([TIME_COL, *wx_num]).sort(TIME_COL)
     wagg = wagg.rename({c: f"wx_{c}" for c in wx_num})
     return wagg
@@ -221,7 +222,7 @@ def transform_weather_pca(weather_daily: pl.DataFrame, pca, sc, wx_cols: List[st
     return out
 
 
-def merge_weather(panel: pl.DataFrame, weather_daily: pl.DataFrame, n_components: int, fit_dates: Optional[List[datetime]] = None):
+def merge_weather(panel: pd.DataFrame, weather_daily: pd.DataFrame, n_components: int, fit_dates: Optional[List[datetime]] = None):
     weather_daily = weather_daily.fill_null(0.0)
     if weather_daily.is_empty():
         names = [f"wx_pca_{i}" for i in range(n_components)]
@@ -231,7 +232,9 @@ def merge_weather(panel: pl.DataFrame, weather_daily: pl.DataFrame, n_components
         return out, None, None, names
     pca, sc, wx_cols, names = fit_weather_pca(weather_daily, n_components, fit_dates)
     wxz = transform_weather_pca(weather_daily, pca, sc, wx_cols, names)
-    out = panel.join(wxz, on=TIME_COL, how="left")
+    wxz_pd = wxz.to_pandas() if hasattr(wxz, "to_pandas") else wxz
+    out = panel.merge(wxz_pd, on=TIME_COL, how="left")
+    out = pl.from_pandas(out)
     for n in names:
         out = out.with_columns(pl.col(n).fill_null(0.0))
-    return out, pca, sc, names
+    return out.to_pandas(), pca, sc, names

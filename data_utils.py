@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Iterator, Optional, Dict, Any, Tuple
 
@@ -10,6 +11,7 @@ from pymongo import MongoClient
 
 from diagnostics import log_mem
 
+logger = logging.getLogger(__name__)
 
 # -------------------------
 # Mongo helpers
@@ -59,7 +61,9 @@ def iter_mongo_df_chunks(
         for d in docs:
             d.pop("_id", None)
 
-        df = pl.DataFrame(docs).fill_null(0.0)
+        df = pl.DataFrame(docs, infer_schema_length=None,   # scan all rows, not just first 50
+    nan_to_null=True,           # turn NaN -> null on ingest
+    strict=False,).fill_null(0.0)
         yield df, str(last_id)
 
 
@@ -95,7 +99,7 @@ def align_df_to_schema(df: pl.DataFrame, schema: pa.Schema) -> pl.DataFrame:
         if pl_type is None:
             continue
         if pl_type == pl.Datetime:
-            out = out.with_columns(pl.col(name).str.strptime(pl.Datetime, strict=False))
+            out = out.with_columns(pl.col(name).dt.replace_time_zone(None))
         elif pl_type in (pl.Float32, pl.Float64):
             out = out.with_columns(pl.col(name).cast(pl_type, strict=False))
         elif pl_type in (pl.Int32, pl.Int64):
@@ -106,7 +110,7 @@ def align_df_to_schema(df: pl.DataFrame, schema: pa.Schema) -> pl.DataFrame:
     return out
 
 
-def stage_collection_with_schema(
+async def stage_collection_with_schema(
     out_path: str,
     iter_chunks_fn,
     canonical_schema: pa.Schema | None = None,
@@ -122,9 +126,9 @@ def stage_collection_with_schema(
         try:
             target_schema = pq.ParquetFile(out_path).schema_arrow
             append = True
-            print("[stage] Using existing file schema:", target_schema)
+            logger.info(f"[stage] Using existing file schema: {target_schema}")
         except Exception as e:
-            print("[stage] Cannot read existing schema:", e)
+            logger.exception(f"[stage] Cannot read existing schema: {e}")
             append = True
     if target_schema is None:
         target_schema = canonical_schema
@@ -141,11 +145,11 @@ def stage_collection_with_schema(
         else:
             df = align_df_to_schema(df, target_schema)
             table = pa.Table.from_arrays([df[c].to_arrow() for c in target_schema.names], schema=target_schema)
-        pq.write_table(table, out_path, compression=compression, append=append)
+        pq.write_table(table, out_path, compression=compression)
         append = True
         with open(ckpt, "w") as f:
             f.write(last_id)
-        print(f"[stage] wrote chunk {i}, rows={len(df)}, checkpoint={last_id}")
+        logger.info(f"[stage] wrote chunk {i}, rows={len(df)}, checkpoint={last_id}")
 
 
 def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200_000):
@@ -166,7 +170,7 @@ def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200
         append = True
         with open(ckpt, "w") as f:
             f.write(last_id)
-        print(f"[stage] wrote chunk {i}, rows={len(df)}")
+        logger.info(f"[stage] wrote chunk {i}, rows={len(df)}")
         log_mem(f"chunk {i} after write")
 
 
@@ -187,7 +191,7 @@ def sanitize_list_column(series: pl.Series, dtype: np.dtype, fixed_len: int | No
             return [0.0] * (fixed_len or 0)
 
     pl_type = pl.List(pl.Float32 if dtype == np.float32 else pl.Float64)
-    return series.apply(_clean).cast(pl_type)
+    return series.map_elements(_clean).cast(pl_type)
 
 
 def table_from_df_and_schema(df: pl.DataFrame, schema: pa.Schema) -> pa.Table:

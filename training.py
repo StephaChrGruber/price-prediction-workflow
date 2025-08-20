@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from sklearn.preprocessing import StandardScaler
@@ -69,20 +70,17 @@ from preprocessing import (
 )
 from constants import TIME_COL, SYMBOL_COL, EPS
 
-setup_diagnostics()
-print(f"[boot] torch: {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
-
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(name)-45s] %(asctime)s [%(levelname)-8s]: %(message)s",
+    format="[%(name)-15s] %(asctime)s [%(levelname)-8s]: %(message)s",
     stream=sys.stdout,
     force=True
 )
 
 logger = logging.getLogger(__name__)
 
-
-
+setup_diagnostics()
+logger.info(f"[boot] torch: {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
 
 # ==========================
 # Targets
@@ -92,6 +90,7 @@ def add_calendar_targets(panel: pd.DataFrame, horizons_days: List[int]):
     panel = panel.sort_values([SYMBOL_COL, TIME_COL]).copy()
     tcols, mcols = [], []
     for h in horizons_days:
+        logger.info(f"Processing horizon {h}")
         tcol, mcol = f"target_{h}d", f"mask_{h}d"
         panel[tcol] = panel.groupby(SYMBOL_COL)["close"].transform(lambda s: (safe_log(s.shift(-h)) - safe_log(s)))
         panel[mcol] = panel[tcol].replace([np.inf,-np.inf], np.nan).notna().astype(int)
@@ -389,61 +388,7 @@ def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
         rows.append(out)
     return pd.DataFrame(rows)
 
-def sanitize_list_column(series: pd.Series,
-                         item_dtype=np.float32,
-                         fixed_len: int | None = None,
-                         fill_value: float = 0.0) -> pd.Series:
-    def _fix(x):
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            a = np.full((fixed_len,), fill_value, dtype=item_dtype) if fixed_len else np.array([], dtype=item_dtype)
-            return a.tolist()
-        a = np.asarray(x, dtype=item_dtype).reshape(-1)
-        if fixed_len is not None:
-            if a.size < fixed_len:
-                a = np.pad(a, (0, fixed_len - a.size), constant_values=fill_value)
-            elif a.size > fixed_len:
-                a = a[:fixed_len]
-        return a.tolist()
-    return series.apply(_fix)
-
-def table_from_df_and_schema(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
-    arrays = []
-    names  = []
-    for field in schema:
-        name, typ = field.name, field.type
-        names.append(name)
-        col = df[name] if name in df.columns else pd.Series([None] * len(df))
-
-        if pa.types.is_timestamp(typ):
-            arr = pa.array(pd.to_datetime(col, errors="coerce"), type=typ)
-        elif pa.types.is_string(typ):
-            arr = pa.array(col.astype("string"))
-        elif pa.types.is_float32(typ):
-            arr = pa.array(pd.to_numeric(col, errors="coerce").astype(np.float32))
-        elif pa.types.is_float64(typ):
-            arr = pa.array(pd.to_numeric(col, errors="coerce").astype(np.float64))
-        elif pa.types.is_int32(typ) or pa.types.is_int64(typ):
-            vals = pd.to_numeric(col, errors="coerce").fillna(0)
-            arr = pa.array(vals.astype(np.int32 if pa.types.is_int32(typ) else np.int64))
-        elif pa.types.is_fixed_size_list(typ):
-            # Ensure sanitize_list_column was applied; enforce dtype/length
-            item_t  = typ.value_type
-            list_sz = typ.list_size
-            seq = col.apply(lambda v: v if isinstance(v, (list, tuple, np.ndarray)) else []).tolist()
-            # Arrow will validate sizes; seq elements must be length == list_sz
-            arr = pa.array(seq, type=typ)
-        elif pa.types.is_list(typ):
-            item_t = typ.value_type
-            seq = col.apply(lambda v: v if isinstance(v, (list, tuple, np.ndarray)) else []).tolist()
-            arr = pa.array(seq, type=typ)  # variable-length lists are fine
-        else:
-            # Fallback (rare)
-            arr = pa.array(col.tolist())
-        arrays.append(arr)
-
-    return pa.Table.from_arrays(arrays, names=names)
-
-def persist_topk_to_mongo(pred_df: DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="outputs"):
+def persist_topk_to_mongo(pred_df: pd.DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="outputs"):
     os.makedirs(outdir, exist_ok=True)
     logger.info(pred_df.to_json())
     cli = mongo_client(mongo_uri); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
@@ -594,7 +539,7 @@ def _process_one_symbol(sym: str,
 
     except Exception as e:
         # If you have a cross-process safe logger, use it; else print
-        print(f"[worker] symbol={sym} failed: {e}", flush=True)
+        logger.exception(f"[worker] symbol={sym} failed: {e}")
         return pd.DataFrame(columns=[SYMBOL_COL, TIME_COL])  # empty
 
 # --- orchestrate in parallel ---------------------
@@ -653,6 +598,7 @@ def prepare_panel(stock_df: pl.DataFrame,
     panel = process_all_symbols_parallel(prices, cal, max_workers=8)
 
     fx_norm = prep_fx(fx_df)
+
     fx_pd = fx_norm.to_pandas() if hasattr(fx_norm, "to_pandas") else fx_norm
     panel = panel.merge(fx_pd, on=TIME_COL, how="left") if not fx_pd.empty else panel.assign(eur_fx_logret=0.0)
 
@@ -791,8 +737,14 @@ async def main(args):
                 start_id=start_id
         ):
             # sanitize arrays
-            df["sentiment"] = sanitize_list_column(df.get("sentiment"), np.float32, fixed_len=None)
-            df["embeddings"] = sanitize_list_column(df.get("embeddings"), np.float32, fixed_len=512)
+            df = df.with_columns(
+                sanitize_list_column(df.get_column("sentiment"), np.float32, fixed_len=None)
+                .alias("sentiment")
+            )
+            df = df.with_columns(
+                sanitize_list_column(df.get_column("embeddings"), np.float32, fixed_len=512)
+                .alias("embeddings")
+            )
             yield df, last_id
 
     async def stage_news(out_path="data/NewsHeadlines.parquet", resume=True):
@@ -816,7 +768,7 @@ async def main(args):
                 writer.write_table(tbl)
                 with open(ckpt, "w") as f:
                     f.write(last_id)
-                print(f"[news] wrote chunk {i} rows={len(df)}")
+                logger.info(f"[news] wrote chunk {i} rows={len(df)}")
         finally:
             if writer: writer.close()
 
@@ -906,11 +858,11 @@ async def main(args):
                                      compression="zstd")
     )"""
 
-    stock  = pd.read_parquet("data/DailyStockData.parquet")
-    crypto = pd.read_parquet("data/DailyCryptoData.parquet")
-    fx     = pd.read_parquet("data/DailyCurrencyExchangeRates.parquet")
-    news   = pd.read_parquet("data/NewsHeadlines.parquet")
-    wxraw  = pd.read_parquet("data/DailyWeatherData.parquet")
+    stock  = pl.read_parquet("data/DailyStockData.parquet")
+    crypto = pl.read_parquet("data/DailyCryptoData.parquet")
+    fx     = pl.read_parquet("data/DailyCurrencyExchangeRates.parquet")
+    news   = pl.read_parquet("data/NewsHeadlines.parquet")
+    wxraw  = pl.read_parquet("data/DailyWeatherData.parquet")
 
     logger.info(f"[data] rows: stock={len(stock)} crypto={len(crypto)} fx={len(fx)} news={len(news)} weather={len(wxraw)}")
 

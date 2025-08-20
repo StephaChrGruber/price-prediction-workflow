@@ -1,3 +1,4 @@
+import logging
 import sys
 import time
 import signal
@@ -14,12 +15,13 @@ import torch
 
 from constants import EPS
 
+logger = logging.getLogger(__name__)
 
 def heartbeat(msg: str = "[hb] alive", every: int = 30) -> None:
     """Print periodic heartbeat messages."""
     def _beat() -> None:
         while True:
-            print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+            logger.info(f"{msg}", )
             time.sleep(every)
     threading.Thread(target=_beat, daemon=True).start()
 
@@ -29,7 +31,7 @@ def log_mem(tag: str) -> None:
     if psutil is None:
         return
     rss = psutil.Process().memory_info().rss / (1024 ** 3)
-    print(f"[mem] {tag}: rss={rss:.2f} GB", flush=True)
+    logger.info(f"[mem] {tag}: rss={rss:.2f} GB")
 
 
 def set_seed(seed: int = 42) -> None:
@@ -55,4 +57,4 @@ def setup_diagnostics() -> None:
     except Exception:
         pass
     heartbeat()
-    print(f"[boot] py={sys.version}")
+    logger.info(f"[boot] py={sys.version}")
