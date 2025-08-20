@@ -285,7 +285,7 @@ def _first_batch_nan_guard(x, y):
         logger.info("[FATAL] Non-finite in Y batch"); idx = torch.where(~torch.isfinite(y)); logger.info(f"indices: {[t[:5].tolist() for t in idx]}"); raise SystemExit(1)
 
 
-def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=5):
+def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=15):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.SmoothL1Loss(); best=float('inf'); best_state=copy.deepcopy(model.state_dict()); bad=0
     model.to(device)

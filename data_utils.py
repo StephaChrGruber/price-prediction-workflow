@@ -136,7 +136,7 @@ async def stage_collection_with_schema(
     start_id = None
     if resume and os.path.exists(ckpt):
         start_id = (open(ckpt).read().strip() or None)
-
+    writer = None
     for i, (df, last_id) in enumerate(iter_chunks_fn(start_id)):
         if target_schema is None:
             df = align_df_to_schema(df, canonical_schema or df.schema)
@@ -145,7 +145,10 @@ async def stage_collection_with_schema(
         else:
             df = align_df_to_schema(df, target_schema)
             table = pa.Table.from_arrays([df[c].to_arrow() for c in target_schema.names], schema=target_schema)
-        pq.write_table(table, out_path, compression=compression)
+
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, target_schema, compression=compression)
+        writer.write_table(table)
         append = True
         with open(ckpt, "w") as f:
             f.write(last_id)
