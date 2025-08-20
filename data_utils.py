@@ -71,12 +71,16 @@ def iter_mongo_df_chunks(
         for d in docs:
             d.pop("_id", None)
 
-        df = pl.DataFrame(
-            docs,
-            infer_schema_length=None,  # scan all rows, not just first 50
-            nan_to_null=True,  # turn NaN -> null on ingest
-            strict=False,
-        ).fill_null(0.0)
+        df = (
+            pl.DataFrame(
+                docs,
+                infer_schema_length=None,  # scan all rows, not just first 50
+                nan_to_null=True,  # turn NaN -> null on ingest
+                strict=False,
+            )
+            .fill_null(0.0)
+            .shrink_to_fit()
+        )
         logger.info(f"[mongo] yielding chunk rows={len(df)} last_id={last_id}")
         yield df, str(last_id)
         del df
