@@ -88,6 +88,7 @@ logger.info(f"[boot] torch: {torch.__version__} | CUDA available: {torch.cuda.is
 # ==========================
 
 def add_calendar_targets(panel: pd.DataFrame, horizons_days: List[int]):
+    logger.info("Adding calendar targets")
     panel = panel.sort_values([SYMBOL_COL, TIME_COL]).copy()
     tcols, mcols = [], []
     for h in horizons_days:
@@ -96,10 +97,12 @@ def add_calendar_targets(panel: pd.DataFrame, horizons_days: List[int]):
         panel[tcol] = panel.groupby(SYMBOL_COL)["close"].transform(lambda s: (safe_log(s.shift(-h)) - safe_log(s)))
         panel[mcol] = panel[tcol].replace([np.inf,-np.inf], np.nan).notna().astype(int)
         tcols.append(tcol); mcols.append(mcol)
+    logger.info(f"Added calendar targets: cols={tcols}")
     return panel, tcols, mcols
 
 
 def add_trading_targets(panel: pd.DataFrame, horizons_td: List[int]):
+    logger.info("Adding trading-day targets")
     pieces = []
     for sym, g in panel.groupby(SYMBOL_COL, sort=False):
         g = g.sort_values(TIME_COL).copy()
@@ -113,6 +116,7 @@ def add_trading_targets(panel: pd.DataFrame, horizons_td: List[int]):
         pieces.append(g)
     panel2 = pd.concat(pieces).sort_values([SYMBOL_COL, TIME_COL])
     tcols = [f"target_td{h}" for h in horizons_td]; mcols = [f"mask_td{h}" for h in horizons_td]
+    logger.info(f"Added trading targets: cols={tcols}")
     return panel2, tcols, mcols
 
 # ==========================
@@ -120,6 +124,7 @@ def add_trading_targets(panel: pd.DataFrame, horizons_td: List[int]):
 # ==========================
 
 def build_sequences_multi(panel: pd.DataFrame, lookback: int, features: List[str], target_cols: List[str], mask_cols: List[str], require_all: bool = True):
+    logger.info("Building sequences")
     panel = panel.sort_values([SYMBOL_COL, TIME_COL])
     X, M, A, Y, D = [], [], [], [], []
     H = len(target_cols)
@@ -129,11 +134,14 @@ def build_sequences_multi(panel: pd.DataFrame, lookback: int, features: List[str
             y = g.loc[t, target_cols].values.astype(np.float32)
             masks = g.loc[t, mask_cols].values.astype(int)
             if require_all:
-                if not np.isfinite(y).all() or masks.sum() < H: continue
+                if not np.isfinite(y).all() or masks.sum() < H:
+                    continue
             else:
-                if not np.isfinite(y).any(): continue
-            win = g.iloc[t-lookback:t]
-            if len(win) < lookback: continue
+                if not np.isfinite(y).any():
+                    continue
+            win = g.iloc[t - lookback : t]
+            if len(win) < lookback:
+                continue
 
             mask_win = win["is_trading_day"].values.astype(bool)
             if not mask_win.any():
@@ -149,18 +157,26 @@ def build_sequences_multi(panel: pd.DataFrame, lookback: int, features: List[str
     A = np.array(A, np.int64)
     Y = np.stack(Y) if len(Y) else np.zeros((0, H), np.float32)
     D = np.array(D)
+    logger.info(f"Built sequences: X={X.shape} Y={Y.shape}")
     return X, M, A, Y, D
 
 
 def time_split_idx(n: int, val_ratio: float = 0.2):
-    val_n = int(n * val_ratio); idx = np.arange(n)
-    return idx[: n - val_n], idx[n - val_n :]
+    logger.info(f"Creating time split n={n} val_ratio={val_ratio}")
+    val_n = int(n * val_ratio)
+    idx = np.arange(n)
+    tr, va = idx[: n - val_n], idx[n - val_n :]
+    logger.info(f"Split sizes: train={len(tr)} val={len(va)}")
+    return tr, va
 
 
 def walk_forward_splits(dates,
                         train_span_days=365*3,
                         val_span_days=90,
                         step_days=90):
+    logger.info(
+        f"Generating walk-forward splits train_span={train_span_days} val_span={val_span_days} step={step_days}"
+    )
     # Normalize to numpy datetime64[ns] array (keeps order, no index semantics)
     dates = pd.to_datetime(dates)
     dates = dates.to_numpy() if hasattr(dates, "to_numpy") else np.asarray(dates, dtype="datetime64[ns]")
@@ -169,17 +185,17 @@ def walk_forward_splits(dates,
         return  # nothing to yield
 
     start = dates.min()
-    end   = dates.max()
+    end = dates.max()
 
     train_span = np.timedelta64(train_span_days, "D")
-    val_span   = np.timedelta64(val_span_days, "D")
-    step       = np.timedelta64(step_days, "D")
+    val_span = np.timedelta64(val_span_days, "D")
+    step = np.timedelta64(step_days, "D")
 
     anchor = start + train_span
-
+    i = 0
     while True:
         train_end = anchor
-        val_end   = train_end + val_span
+        val_end = train_end + val_span
         if train_end > end or val_end > end:
             break
 
@@ -191,19 +207,32 @@ def walk_forward_splits(dates,
         va_idx = np.flatnonzero(va_mask)
 
         if tr_idx.size and va_idx.size:
+            logger.info(
+                f"[split {i}] train={tr_idx.size} val={va_idx.size} anchor={anchor}"
+            )
             yield tr_idx, va_idx
+            i += 1
 
         anchor = anchor + step
 
 
 def fit_scaler_on_train(Xtr: np.ndarray) -> StandardScaler:
-    if Xtr.size == 0: raise RuntimeError("Empty training set after filtering.")
-    N, T, F = Xtr.shape; sc = StandardScaler().fit(Xtr.reshape(N*T, F)); return sc
+    if Xtr.size == 0:
+        raise RuntimeError("Empty training set after filtering.")
+    logger.info(f"Fitting scaler on data shape={Xtr.shape}")
+    N, T, F = Xtr.shape
+    sc = StandardScaler().fit(Xtr.reshape(N * T, F))
+    logger.info("Scaler fitted")
+    return sc
 
 
 def apply_scaler(X: np.ndarray, sc: StandardScaler) -> np.ndarray:
-    if X.size == 0: return X
-    N, T, F = X.shape; return sc.transform(X.reshape(N*T, F)).reshape(N, T, F)
+    if X.size == 0:
+        logger.info("apply_scaler received empty array")
+        return X
+    logger.debug(f"Applying scaler to array shape={X.shape}")
+    N, T, F = X.shape
+    return sc.transform(X.reshape(N * T, F)).reshape(N, T, F)
 
 # ==========================
 # Models & training
@@ -287,6 +316,7 @@ def _first_batch_nan_guard(x, y):
 
 
 def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=15):
+    logger.info("Starting point training")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.SmoothL1Loss(); best=float('inf'); best_state=copy.deepcopy(model.state_dict()); bad=0
     model.to(device)
@@ -313,10 +343,13 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
             bad += 1
             if bad > patience: logger.info("Early stop")
             break
-    model.load_state_dict(best_state); return model, best
+    model.load_state_dict(best_state)
+    logger.info("Finished point training")
+    return model, best
 
 
 def train_quant(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=5):
+    logger.info("Starting quantile training")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay); Q = model.quantiles
     best=float('inf'); best_state=copy.deepcopy(model.state_dict()); bad=0
     model.to(device)
@@ -344,14 +377,18 @@ def train_quant(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
             if bad>patience:
                 logger.info("Early stop")
                 break
-    model.load_state_dict(best_state); return model, best
+    model.load_state_dict(best_state)
+    logger.info("Finished quantile training")
+    return model, best
 
 # ==========================
 # Scoring & persistence
 # ==========================
 
 def score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device):
-    rows = []; L = args.lookback
+    logger.info("Scoring point predictions")
+    rows = []
+    L = args.lookback
     for sym, g in panel.groupby(SYMBOL_COL):
         g = g.sort_values(TIME_COL)
         if len(g) < L: continue
@@ -366,11 +403,16 @@ def score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device):
         for h,v in zip(HORIZONS, yh):
             lab=HLAB[h]; out[f"pred_{lab}_logret"]=float(v); out[f"pred_{lab}_ret"]=float(np.expm1(v))
         rows.append(out)
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    logger.info(f"Point predictions generated: rows={len(df)}")
+    return df
 
 
 def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
-    rows = []; q2i = {q:i for i,q in enumerate(QUANTS)}; L = args.lookback
+    logger.info("Scoring quantile predictions")
+    rows = []
+    q2i = {q: i for i, q in enumerate(QUANTS)}
+    L = args.lookback
     for sym, g in panel.groupby(SYMBOL_COL):
         g = g.sort_values(TIME_COL)
         if len(g) < L: continue
@@ -387,14 +429,23 @@ def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
             for q in QUANTS:
                 v=float(yhq[hi,q2i[q]]); out[f"pred_{lab}_p{int(q*100)}_logret"]=v; out[f"pred_{lab}_p{int(q*100)}_ret"]=float(np.expm1(v))
         rows.append(out)
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    logger.info(f"Quantile predictions generated: rows={len(df)}")
+    return df
 
 def persist_topk_to_mongo(pred_df: pd.DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="outputs"):
+    logger.info(
+        f"Persisting top {top_k} predictions to MongoDB collection {dbname}.{coll_pred}"
+    )
     os.makedirs(outdir, exist_ok=True)
     logger.info(pred_df.to_json())
-    cli = mongo_client(); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
-    out = pred_df.head(top_k).copy(); out["as_of"]=as_of
-    if len(out): cli[dbname][coll_pred].insert_many(out.to_dict(orient="records")); logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
+    cli = mongo_client()
+    as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    out = pred_df.head(top_k).copy()
+    out["as_of"] = as_of
+    if len(out):
+        cli[dbname][coll_pred].insert_many(out.to_dict(orient="records"))
+        logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
 
 
 def save_artifacts(model, scaler, asset2id, FEATURES, outdir="artifacts"):
@@ -551,6 +602,7 @@ def process_all_symbols_parallel(prices: pd.DataFrame,
     Parallelize the per-symbol processing with a process pool.
     """
     max_workers = max_workers or max(1, (os.cpu_count() or 2) - 1)
+    logger.info(f"Processing {prices[SYMBOL_COL].nunique()} symbols in parallel")
 
     # Build tasks: one (sym, df) per symbol
     tasks = [(sym, grp.copy()) for sym, grp in prices.groupby(SYMBOL_COL, sort=False)]
@@ -563,8 +615,11 @@ def process_all_symbols_parallel(prices: pd.DataFrame,
             rows = [f.result() for f in futures]  # collect (raises errors if any)
 
     if not rows:
+        logger.info("No rows returned from parallel processing")
         return pd.DataFrame()
-    return pd.concat(rows, ignore_index=True)
+    out = pd.concat(rows, ignore_index=True)
+    logger.info(f"Parallel processing complete: rows={len(out)}")
+    return out
 
 # -------------------------------------------------
 # Panel preparation helpers
@@ -577,9 +632,11 @@ def daily_calendar(prices: pd.DataFrame) -> pd.DatetimeIndex:
 
 
 def add_time_feats(df: pd.DataFrame) -> pd.DataFrame:
+    logger.info("Adding time features")
     df["dow"] = df[TIME_COL].dt.dayofweek
     df["dom"] = df[TIME_COL].dt.day
     df["month"] = df[TIME_COL].dt.month
+    logger.info("Added time features")
     return df
 
 
@@ -587,6 +644,7 @@ def prepare_panel(stock_df: pl.DataFrame,
                   crypto_df: pl.DataFrame,
                   fx_df: pl.DataFrame,
                   news_df: pl.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    logger.info("Preparing panel data")
     s = prep_stocks(stock_df)
     c = prep_crypto(crypto_df)
     s_pd = s.to_pandas() if hasattr(s, "to_pandas") else s
@@ -621,6 +679,7 @@ def prepare_panel(stock_df: pl.DataFrame,
 
     asset2id = {s: i for i, s in enumerate(sorted(panel[SYMBOL_COL].dropna().unique()))}
     panel["asset_id"] = panel[SYMBOL_COL].map(asset2id).astype(int)
+    logger.info(f"Prepared panel: shape={panel.shape}")
     return panel, asset2id
 
 async def main(args):
