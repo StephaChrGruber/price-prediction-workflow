@@ -31,11 +31,11 @@ def prep_stocks(df: pl.DataFrame) -> pl.DataFrame:
     d = d.rename({"date": TIME_COL, "symbol": SYMBOL_COL})
     d = d.with_columns([
         to_dt(d.get_column(TIME_COL)),
-        pl.col("open").cast(pl.Float64, strict=False),
-        pl.col("close").cast(pl.Float64, strict=False),
-        pl.col("high").cast(pl.Float64, strict=False),
-        pl.col("low").cast(pl.Float64, strict=False),
-        pl.col("volume").cast(pl.Float64, strict=False),
+        pl.col("open").cast(pl.Float32, strict=False),
+        pl.col("close").cast(pl.Float32, strict=False),
+        pl.col("high").cast(pl.Float32, strict=False),
+        pl.col("low").cast(pl.Float32, strict=False),
+        pl.col("volume").cast(pl.Float32, strict=False),
     ])
     d = d.drop_nulls([TIME_COL, SYMBOL_COL]).sort([SYMBOL_COL, TIME_COL])
     d = d.with_columns(pl.lit("stock").alias("source"))
@@ -70,7 +70,7 @@ def prep_crypto(df: pl.DataFrame) -> pl.DataFrame:
     d = d.rename({"date": TIME_COL, "symbol": SYMBOL_COL})
     d = d.with_columns([to_dt(pl.col(TIME_COL))])
     num_cols = [c for c in needed if c not in {"date", "symbol"}]
-    d = d.with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in num_cols])
+    d = d.with_columns([pl.col(c).cast(pl.Float32, strict=False) for c in num_cols])
     d = d.drop_nulls([TIME_COL, SYMBOL_COL]).sort([SYMBOL_COL, TIME_COL])
     d = d.with_columns(pl.lit("crypto").alias("source"))
     out = d.select(
@@ -104,14 +104,14 @@ def prep_fx(df: pl.DataFrame) -> pl.DataFrame:
     rate_cols = [c for c in d.columns if c not in {TIME_COL, "base_currency"}]
     if not rate_cols:
         return pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": np.zeros(len(d), dtype=float)})
-    rates = d.select(rate_cols).with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in rate_cols])
+    rates = d.select(rate_cols).with_columns([pl.col(c).cast(pl.Float32, strict=False) for c in rate_cols])
     rates = rates.fill_null(strategy="forward").fill_null(strategy="backward").fill_null(1.0)
     rates = rates.select([pl.col(c).clip(lower_bound=EPS) for c in rate_cols])
     log_rates = np.log(rates.to_numpy())
     dlog = np.diff(log_rates, axis=0)
     dlog = np.vstack([np.zeros((1, dlog.shape[1]), dtype=float), dlog])
     eur_fx_logret = np.nanmean(dlog, axis=1)
-    eur_fx_logret = np.where(np.isfinite(eur_fx_logret), eur_fx_logret, 0.0)
+    eur_fx_logret = np.where(np.isfinite(eur_fx_logret), eur_fx_logret, 0.0).astype(np.float32)
     out = pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": eur_fx_logret})
     logger.info(f"Prepared FX: shape={out.shape}")
     return out
@@ -175,6 +175,7 @@ def prep_news_global(df: pl.DataFrame, pca_cap: int = 32) -> pl.DataFrame:
         [pl.col(f"news_pca_{i}").mean().alias(f"news_pca_{i}") for i in range(dim)]
     )
     out = d.group_by(TIME_COL).agg(agg_expr).sort(TIME_COL)
+    out = out.with_columns(pl.all().exclude(TIME_COL).cast(pl.Float32, strict=False))
     logger.info(f"Prepared News: shape={out.shape}")
     return out
 
@@ -187,7 +188,7 @@ def prep_weather_daily(weather_df: pl.DataFrame, agg: str = "mean") -> pl.DataFr
     w = w.with_columns(to_dt(pl.col(TIME_COL)))
     w = w.drop_nulls([TIME_COL])
     wx_num = [c for c in ["tavg", "tmin", "tmax", "prcp", "snow", "wdir", "wspd", "wpgt", "pres", "tsun"] if c in w.columns]
-    w = w.with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in wx_num])
+    w = w.with_columns([pl.col(c).cast(pl.Float32, strict=False) for c in wx_num])
     if agg == "median":
         wagg = w.group_by(TIME_COL).median()
     else:
@@ -210,7 +211,7 @@ def fit_weather_pca(weather_daily: pl.DataFrame, n_components: int, fit_dates: O
             logger.info("No weather rows for given fit dates")
             return None, None, wx_cols, []
     sc = StandardScaler()
-    Xfit = sc.fit_transform(df.select(wx_cols).to_numpy())
+    Xfit = sc.fit_transform(df.select(wx_cols).to_numpy()).astype(np.float32)
     pca = IncrementalPCA(n_components=min(n_components, Xfit.shape[1]))
     for i in range(0, Xfit.shape[0], 20000):
         pca.partial_fit(Xfit[i : i + 20000])
@@ -226,8 +227,8 @@ def transform_weather_pca(weather_daily: pl.DataFrame, pca, sc, wx_cols: List[st
             out = out.with_columns(pl.lit(0.0).alias(n))
         logger.info("Weather PCA transform skipped, returning zeros")
         return out
-    X = sc.transform(weather_daily.select(wx_cols).to_numpy())
-    Z = pca.transform(X)
+    X = sc.transform(weather_daily.select(wx_cols).to_numpy()).astype(np.float32)
+    Z = pca.transform(X).astype(np.float32)
     out = weather_daily.select([TIME_COL]).clone()
     for i, n in enumerate(names):
         out = out.with_columns(pl.Series(n, Z[:, i].astype(np.float32)))

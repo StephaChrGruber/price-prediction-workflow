@@ -70,6 +70,7 @@ from preprocessing import (
     transform_weather_pca,
 )
 from constants import TIME_COL, SYMBOL_COL, EPS
+from memory_utils import reduce_mem_usage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -647,22 +648,28 @@ def prepare_panel(stock_df: pl.DataFrame,
     logger.info("Preparing panel data")
     s = prep_stocks(stock_df)
     c = prep_crypto(crypto_df)
-    s_pd = s.to_pandas() if hasattr(s, "to_pandas") else s
-    c_pd = c.to_pandas() if hasattr(c, "to_pandas") else c
+    s_pd = reduce_mem_usage(s.to_pandas() if hasattr(s, "to_pandas") else s)
+    c_pd = reduce_mem_usage(c.to_pandas() if hasattr(c, "to_pandas") else c)
     if s_pd.empty and c_pd.empty:
         raise RuntimeError("No stock or crypto rows found.")
-    prices = pd.concat([s_pd, c_pd], ignore_index=True)
+    prices = reduce_mem_usage(pd.concat([s_pd, c_pd], ignore_index=True))
+    del s_pd, c_pd
+    gc.collect()
 
     cal = daily_calendar(prices)
     panel = process_all_symbols_parallel(prices, cal, max_workers=8)
+    del prices
+    gc.collect()
 
     fx_norm = prep_fx(fx_df)
 
-    fx_pd = fx_norm.to_pandas() if hasattr(fx_norm, "to_pandas") else fx_norm
+    fx_pd = reduce_mem_usage(fx_norm.to_pandas() if hasattr(fx_norm, "to_pandas") else fx_norm)
     panel = panel.merge(fx_pd, on=TIME_COL, how="left") if not fx_pd.empty else panel.assign(eur_fx_logret=0.0)
+    del fx_pd
+    gc.collect()
 
     newsg = prep_news_global(news_df)
-    news_pd = newsg.to_pandas() if hasattr(newsg, "to_pandas") else newsg
+    news_pd = reduce_mem_usage(newsg.to_pandas() if hasattr(newsg, "to_pandas") else newsg)
     if not news_pd.empty:
         panel = panel.merge(news_pd, on=TIME_COL, how="left")
     else:
@@ -671,14 +678,19 @@ def prepare_panel(stock_df: pl.DataFrame,
         panel["news_count"] = 0
         for i in range(8):
             panel[f"news_pca_{i}"] = 0.0
+    del news_pd
+    gc.collect()
 
     panel = add_time_feats(panel)
+    panel = reduce_mem_usage(panel)
 
     num_cols = panel.select_dtypes(include=[np.number]).columns
-    panel[num_cols] = panel[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    panel[num_cols] = (
+        panel[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32)
+    )
 
     asset2id = {s: i for i, s in enumerate(sorted(panel[SYMBOL_COL].dropna().unique()))}
-    panel["asset_id"] = panel[SYMBOL_COL].map(asset2id).astype(int)
+    panel["asset_id"] = panel[SYMBOL_COL].map(asset2id).astype(np.int32)
     logger.info(f"Prepared panel: shape={panel.shape}")
     return panel, asset2id
 
