@@ -39,7 +39,9 @@ def prep_stocks(df: pl.DataFrame) -> pl.DataFrame:
     ])
     d = d.drop_nulls([TIME_COL, SYMBOL_COL]).sort([SYMBOL_COL, TIME_COL])
     d = d.with_columns(pl.lit("stock").alias("source"))
-    return d.select([SYMBOL_COL, TIME_COL, "open", "close", "high", "low", "volume", "source"])
+    out = d.select([SYMBOL_COL, TIME_COL, "open", "close", "high", "low", "volume", "source"])
+    logger.info(f"Prepared stocks: shape={out.shape}")
+    return out
 
 
 def prep_crypto(df: pl.DataFrame) -> pl.DataFrame:
@@ -71,7 +73,7 @@ def prep_crypto(df: pl.DataFrame) -> pl.DataFrame:
     d = d.with_columns([pl.col(c).cast(pl.Float64, strict=False) for c in num_cols])
     d = d.drop_nulls([TIME_COL, SYMBOL_COL]).sort([SYMBOL_COL, TIME_COL])
     d = d.with_columns(pl.lit("crypto").alias("source"))
-    return d.select(
+    out = d.select(
         [
             SYMBOL_COL,
             TIME_COL,
@@ -89,6 +91,8 @@ def prep_crypto(df: pl.DataFrame) -> pl.DataFrame:
             "source",
         ]
     )
+    logger.info(f"Prepared crypto: shape={out.shape}")
+    return out
 
 def prep_fx(df: pl.DataFrame) -> pl.DataFrame:
     logger.info("Preparing FX")
@@ -108,7 +112,9 @@ def prep_fx(df: pl.DataFrame) -> pl.DataFrame:
     dlog = np.vstack([np.zeros((1, dlog.shape[1]), dtype=float), dlog])
     eur_fx_logret = np.nanmean(dlog, axis=1)
     eur_fx_logret = np.where(np.isfinite(eur_fx_logret), eur_fx_logret, 0.0)
-    return pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": eur_fx_logret})
+    out = pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": eur_fx_logret})
+    logger.info(f"Prepared FX: shape={out.shape}")
+    return out
 
 
 def _extract_sentiment(val) -> float:
@@ -168,8 +174,9 @@ def prep_news_global(df: pl.DataFrame, pca_cap: int = 32) -> pl.DataFrame:
     agg_expr.extend(
         [pl.col(f"news_pca_{i}").mean().alias(f"news_pca_{i}") for i in range(dim)]
     )
-
-    return d.group_by(TIME_COL).agg(agg_expr).sort(TIME_COL)
+    out = d.group_by(TIME_COL).agg(agg_expr).sort(TIME_COL)
+    logger.info(f"Prepared News: shape={out.shape}")
+    return out
 
 
 def prep_weather_daily(weather_df: pl.DataFrame, agg: str = "mean") -> pl.DataFrame:
@@ -187,17 +194,20 @@ def prep_weather_daily(weather_df: pl.DataFrame, agg: str = "mean") -> pl.DataFr
         wagg = w.group_by(TIME_COL).mean()
     wagg = wagg.select([TIME_COL, *wx_num]).sort(TIME_COL)
     wagg = wagg.rename({c: f"wx_{c}" for c in wx_num})
+    logger.info(f"Prepared Weather: shape={wagg.shape}")
     return wagg
 
 
 def fit_weather_pca(weather_daily: pl.DataFrame, n_components: int, fit_dates: Optional[List[datetime]] = None):
     wx_cols = [c for c in weather_daily.columns if c.startswith("wx_")]
     if not wx_cols:
+        logger.info("No weather columns for PCA")
         return None, None, [], []
     df = weather_daily.clone()
     if fit_dates is not None:
         df = df.filter(pl.col(TIME_COL).is_in(fit_dates))
         if df.is_empty():
+            logger.info("No weather rows for given fit dates")
             return None, None, wx_cols, []
     sc = StandardScaler()
     Xfit = sc.fit_transform(df.select(wx_cols).to_numpy())
@@ -205,6 +215,7 @@ def fit_weather_pca(weather_daily: pl.DataFrame, n_components: int, fit_dates: O
     for i in range(0, Xfit.shape[0], 20000):
         pca.partial_fit(Xfit[i : i + 20000])
     names = [f"wx_pca_{i}" for i in range(pca.n_components_)]
+    logger.info(f"Fitted weather PCA: components={len(names)}")
     return pca, sc, wx_cols, names
 
 
@@ -213,12 +224,14 @@ def transform_weather_pca(weather_daily: pl.DataFrame, pca, sc, wx_cols: List[st
         out = weather_daily.select([TIME_COL])
         for n in names:
             out = out.with_columns(pl.lit(0.0).alias(n))
+        logger.info("Weather PCA transform skipped, returning zeros")
         return out
     X = sc.transform(weather_daily.select(wx_cols).to_numpy())
     Z = pca.transform(X)
     out = weather_daily.select([TIME_COL]).clone()
     for i, n in enumerate(names):
         out = out.with_columns(pl.Series(n, Z[:, i].astype(np.float32)))
+    logger.info(f"Transformed weather PCA: shape={out.shape}")
     return out
 
 
@@ -229,6 +242,7 @@ def merge_weather(panel: pd.DataFrame, weather_daily: pd.DataFrame, n_components
         out = panel.clone()
         for n in names:
             out = out.with_columns(pl.lit(0.0).alias(n))
+        logger.info("Weather data empty, filled zeros")
         return out, None, None, names
     pca, sc, wx_cols, names = fit_weather_pca(weather_daily, n_components, fit_dates)
     wxz = transform_weather_pca(weather_daily, pca, sc, wx_cols, names)
@@ -237,4 +251,5 @@ def merge_weather(panel: pd.DataFrame, weather_daily: pd.DataFrame, n_components
     out = pl.from_pandas(out)
     for n in names:
         out = out.with_columns(pl.col(n).fill_null(0.0))
+    logger.info(f"Merged weather data: shape={out.shape}")
     return out.to_pandas(), pca, sc, names

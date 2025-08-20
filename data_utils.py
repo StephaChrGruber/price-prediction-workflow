@@ -23,7 +23,7 @@ def mongo_client() -> MongoClient:
         f"mongodb://admin:2059$tephan5203@94.130.171.244:27017,host.docker.internal:27017,homeassistant.local:27017"
         f"/PriceForecast?authSource=admin&replicaSet=rs0&readPreference=primary&w=majority&retryWrites=true"
     )
-
+    logger.info("Creating MongoClient")
     return MongoClient(
         uri,
         compressors="zstd,snappy",
@@ -45,6 +45,9 @@ def iter_mongo_df_chunks(
     query = dict(query or {})
     projection = projection
     last_id = ObjectId(start_id) if start_id else None
+    logger.info(
+        f"[mongo] start iterating chunks chunk_rows={chunk_rows} start_id={start_id}"
+    )
 
     while True:
         q = query.copy()
@@ -61,15 +64,20 @@ def iter_mongo_df_chunks(
         docs = list(cur)
         cur.close()
         if not docs:
+            logger.info("[mongo] no more documents, stopping iteration")
             break
 
         last_id = docs[-1]["_id"]
         for d in docs:
             d.pop("_id", None)
 
-        df = pl.DataFrame(docs, infer_schema_length=None,   # scan all rows, not just first 50
-    nan_to_null=True,           # turn NaN -> null on ingest
-    strict=False,).fill_null(0.0)
+        df = pl.DataFrame(
+            docs,
+            infer_schema_length=None,  # scan all rows, not just first 50
+            nan_to_null=True,  # turn NaN -> null on ingest
+            strict=False,
+        ).fill_null(0.0)
+        logger.info(f"[mongo] yielding chunk rows={len(df)} last_id={last_id}")
         yield df, str(last_id)
         del df
         del docs
@@ -98,6 +106,7 @@ def _arrow_field_to_pl_dtype(field: pa.Field):
 
 
 def align_df_to_schema(df: pl.DataFrame, schema: pa.Schema) -> pl.DataFrame:
+    logger.debug(f"[align] aligning df shape={df.shape} to schema")
     out = df.clone()
     for field in schema:
         name = field.name
@@ -126,6 +135,7 @@ async def stage_collection_with_schema(
     resume: bool = True,
     compression: str = "zstd",
 ):
+    logger.info(f"[stage] starting staged write to {out_path}")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     ckpt = out_path + ".ckpt"
 
@@ -153,7 +163,9 @@ async def stage_collection_with_schema(
             target_schema = table.schema
         else:
             df = align_df_to_schema(df, target_schema)
-            table = pa.Table.from_arrays([df[c].to_arrow() for c in target_schema.names], schema=target_schema)
+            table = pa.Table.from_arrays(
+                [df[c].to_arrow() for c in target_schema.names], schema=target_schema
+            )
 
         if writer is None:
             writer = pq.ParquetWriter(out_path, target_schema, compression=compression)
@@ -166,8 +178,13 @@ async def stage_collection_with_schema(
         del df
         gc.collect()
 
+    if writer:
+        writer.close()
+    logger.info(f"[stage] completed staged write to {out_path}")
+
 
 def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200_000):
+    logger.info(f"[stage] starting simple stage to {out_path}")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     ckpt = out_path + ".ckpt"
 
@@ -190,6 +207,7 @@ def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200
         del df
         gc.collect()
         log_mem(f"chunk {i} after write")
+    logger.info(f"[stage] completed staging to {out_path}")
 
 
 # -------------------------
@@ -197,6 +215,7 @@ def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200
 # -------------------------
 
 def sanitize_list_column(series: pl.Series, dtype: np.dtype, fixed_len: int | None) -> pl.Series:
+    logger.debug(f"[sanitize] dtype={dtype} fixed_len={fixed_len}")
     def _clean(val):
         try:
             arr = np.asarray(val, dtype=dtype)
@@ -213,6 +232,7 @@ def sanitize_list_column(series: pl.Series, dtype: np.dtype, fixed_len: int | No
 
 
 def table_from_df_and_schema(df: pl.DataFrame, schema: pa.Schema) -> pa.Table:
+    logger.debug(f"[table] building table with schema fields={schema.names}")
     df = align_df_to_schema(df, schema)
     arrays = [df[name].to_arrow() for name in schema.names]
     return pa.Table.from_arrays(arrays, schema=schema)
