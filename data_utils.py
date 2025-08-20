@@ -17,7 +17,12 @@ logger = logging.getLogger(__name__)
 # Mongo helpers
 # -------------------------
 
-def mongo_client(uri: str) -> MongoClient:
+def mongo_client() -> MongoClient:
+    uri = (
+        f"mongodb://admin:2059$tephan5203@94.130.171.244:27017,host.docker.internal:27017,homeassistant.local:27017"
+        f"/PriceForecast?authSource=admin&replicaSet=rs0&readPreference=primary&w=majority&retryWrites=true"
+    )
+
     return MongoClient(
         uri,
         compressors="zstd,snappy",

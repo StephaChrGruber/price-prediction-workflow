@@ -391,7 +391,7 @@ def score_quant(panel, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device):
 def persist_topk_to_mongo(pred_df: pd.DataFrame, mongo_uri, dbname, coll_pred, top_k, outdir="outputs"):
     os.makedirs(outdir, exist_ok=True)
     logger.info(pred_df.to_json())
-    cli = mongo_client(mongo_uri); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    cli = mongo_client(); as_of = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
     out = pred_df.head(top_k).copy(); out["as_of"]=as_of
     if len(out): cli[dbname][coll_pred].insert_many(out.to_dict(orient="records")); logger.info(f"Inserted {len(out)} docs into {dbname}.{coll_pred}")
 
@@ -637,7 +637,7 @@ async def main(args):
 
 
     logger.info("Connecting to MongoDB")
-    cli = mongo_client(args.mongo_uri); db = cli[args.db]
+    cli = mongo_client(); db = cli[args.db]
 
     def iter_stocks_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
