@@ -6,6 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="2f5abf09-aae7-4638-8b7a-5705127a2e22" name="Changes" comment="Updates">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/training.py" beforeDir="false" afterPath="$PROJECT_DIR$/training.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -42,15 +43,15 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;Python.Price prediction training.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.Price prediction training.executor": "Debug",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "main"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="MoveFile.RECENT_KEYS">
       <recent name="$PROJECT_DIR$" />
@@ -96,14 +97,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1755267431090</updated>
-    </task>
-    <task id="LOCAL-00008" summary="initial commit">
-      <option name="closed" value="true" />
-      <created>1755500940549</created>
-      <option name="number" value="00008" />
-      <option name="presentableId" value="LOCAL-00008" />
-      <option name="project" value="LOCAL" />
-      <updated>1755500940549</updated>
     </task>
     <task id="LOCAL-00009" summary="initial commit">
       <option name="closed" value="true" />
@@ -489,7 +482,15 @@
       <option name="project" value="LOCAL" />
       <updated>1755625681961</updated>
     </task>
-    <option name="localTasksCounter" value="57" />
+    <task id="LOCAL-00057" summary="Updates">
+      <option name="closed" value="true" />
+      <created>1755626926774</created>
+      <option name="number" value="00057" />
+      <option name="presentableId" value="LOCAL-00057" />
+      <option name="project" value="LOCAL" />
+      <updated>1755626926774</updated>
+    </task>
+    <option name="localTasksCounter" value="58" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
@@ -507,23 +508,33 @@
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1363</line>
-          <option name="timeStamp" value="41" />
+          <line>556</line>
+          <option name="timeStamp" value="46" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1246</line>
-          <option name="timeStamp" value="43" />
+          <line>547</line>
+          <option name="timeStamp" value="47" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1212</line>
-          <option name="timeStamp" value="44" />
+          <line>1388</line>
+          <option name="timeStamp" value="48" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/training.py</url>
-          <line>1177</line>
-          <option name="timeStamp" value="45" />
+          <line>1386</line>
+          <option name="timeStamp" value="49" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/training.py</url>
+          <line>1376</line>
+          <option name="timeStamp" value="50" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/training.py</url>
+          <line>1370</line>
+          <option name="timeStamp" value="51" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>

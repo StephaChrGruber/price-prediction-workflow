@@ -6,3 +6,5 @@ scikit-learn
 tqdm
 pyarrow
 dnnlib-util
+zstandard
+python-snappy

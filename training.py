@@ -23,10 +23,11 @@ Run (example):
 import os, sys, time, signal, threading
 
 # 1) Always print tracebacks on crashes/timeouts
-import faulthandler;
+import faulthandler
 from asyncio import as_completed
 from concurrent.futures import ProcessPoolExecutor, wait
 from datetime import datetime, timedelta
+import asyncio
 
 faulthandler.enable()
 # Dump stack on SIGTERM or when we poke SIGUSR1
@@ -149,7 +150,7 @@ def iter_mongo_df_chunks(
         if last_id:
             q["_id"] = {"$gt": last_id}
 
-        cur = (coll.find(q, projection, no_cursor_timeout=True)
+        cur = (coll.find(q, projection)
                  .sort([("_id", 1)])
                  .limit(chunk_rows)
                  .batch_size(batch_size_db))
@@ -253,7 +254,7 @@ def align_df_to_schema(df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
     return out
 
 # --- staging that respects existing file schema and enforces order ---
-def stage_collection_with_schema(
+async def stage_collection_with_schema(
     out_path: str,
     iter_chunks_fn,                 # callable(start_id) -> yields (df, last_id)
     canonical_schema: pa.Schema|None = None,
@@ -447,6 +448,7 @@ def prep_news_global(df: pd.DataFrame, pca_cap: int = 32) -> pd.DataFrame:
         return df
     d = df.copy()
     d[TIME_COL] = to_dt(d.get(TIME_COL, pd.Series(index=d.index)))
+    d[TIME_COL] = d[TIME_COL].dt.normalize()
     d = d.dropna(subset=[TIME_COL])
     d["sentiment_scalar"] = d.get("sentiment", 0).apply(_extract_sentiment) if "sentiment" in d.columns else 0.0
     def _to_vec(x):
@@ -553,7 +555,8 @@ def prep_weather_daily(weather_df: pd.DataFrame, agg: str = "mean") -> pd.DataFr
     logger.info("Grouping Weather")
     if agg == "median": wagg = w.groupby(TIME_COL)[wx_num].median().reset_index()
     else: wagg = w.groupby(TIME_COL)[wx_num].mean().reset_index()
-    logger.info("Renaming Weather columns")
+    logger.info("Sorting Weather")
+    wagg = wagg.sort_values(TIME_COL)
     wagg = wagg.rename(columns={c: f"wx_{c}" for c in wx_num})
     return wagg
 
@@ -1136,7 +1139,7 @@ def process_all_symbols_parallel(prices: pd.DataFrame,
 
 # panel = process_all_symbols_parallel(prices, cal, max_workers=8)
 
-def main(args):
+async def main(args):
     logger.info("[boot] starting main()")
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1158,7 +1161,7 @@ def main(args):
                 db.DailyStockData,
                 query={"date" : {"$lte" : datetime.today().replace(hour = 0, minute = 0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
                 projection={"date": 1, "symbol": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
-                chunk_rows=200_000,
+                chunk_rows=100_000,
                 start_id=start_id
         ):
             yield df, last_id
@@ -1175,19 +1178,12 @@ def main(args):
             pa.field("volume", f),
         ])
 
-    stage_collection_with_schema(
-                                out_path="data/DailyStockData.parquet",
-                                iter_chunks_fn=iter_stocks_chunks,
-                                canonical_schema=stock_schema(32),  # used only if file doesn't exist yet
-                                resume=True,
-                                compression="zstd")
-
     def iter_crypto_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
                 db.DailyCryptoData,
                 query={"date": {
                     "$lte": datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
-                chunk_rows=200_000,
+                chunk_rows=100_000,
                 start_id=start_id
         ):
             yield df, last_id
@@ -1210,18 +1206,12 @@ def main(args):
             pa.field("openPctChange", f)
         ])
 
-    stage_collection_with_schema(out_path="data/DailyCryptoData.parquet",
-                                iter_chunks_fn=iter_crypto_chunks,
-                                canonical_schema=crypto_schema(32),  # used only if file doesn't exist yet
-                                resume=True,
-                                compression="zstd")
-
     def iter_weather_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
                 db.DailyWeatherData,
                 query={"date": {
                     "$lte": datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
-                chunk_rows=200_000,
+                chunk_rows=100_000,
                 start_id=start_id
         ):
             yield df, last_id
@@ -1244,12 +1234,6 @@ def main(args):
             pa.field("tsun", f)
         ])
 
-    stage_collection_with_schema(out_path="data/DailyWeatherData.parquet",
-                                iter_chunks_fn=iter_weather_chunks,
-                                canonical_schema=weather_schema(32),  # used only if file doesn't exist yet
-                                resume=True,
-                                compression="zstd")
-
     def news_schema() -> pa.Schema:
         return pa.schema([
             pa.field("date", pa.timestamp("ns")),
@@ -1266,7 +1250,7 @@ def main(args):
                 query={"date": {
                     "$lte": datetime.today().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=args.ignore_days)}},
                 projection={"date": 1, "headline": 1, "sentiment": 1, "embeddings": 1},
-                chunk_rows=200_000,
+                chunk_rows=20000,
                 start_id=start_id
         ):
             # sanitize arrays
@@ -1274,7 +1258,7 @@ def main(args):
             df["embeddings"] = sanitize_list_column(df.get("embeddings"), np.float32, fixed_len=512)
             yield df, last_id
 
-    def stage_news(out_path="data/NewsHeadlines.parquet", resume=True):
+    async def stage_news(out_path="data/NewsHeadlines.parquet", resume=True):
         schema = news_schema()
         # If the file exists, read its schema so we match order/types:
         target_schema = schema
@@ -1299,7 +1283,7 @@ def main(args):
         finally:
             if writer: writer.close()
 
-    stage_news()
+
 
     def iter_fx_chunks(start_id=None):
         for df, last_id in iter_mongo_df_chunks(
@@ -1361,12 +1345,29 @@ def main(args):
             pa.field("ZMW", f), pa.field("ZWL", f),
         ])
 
-    stage_collection_with_schema(out_path="data/DailyCurrencyExchangeRates.parquet",
-                                iter_chunks_fn=iter_fx_chunks,
-                                canonical_schema=fx_schema(32),  # used only if file doesn't exist yet
+    """await asyncio.gather(stage_collection_with_schema(
+                                out_path="data/DailyStockData.parquet",
+                                iter_chunks_fn=iter_stocks_chunks,
+                                canonical_schema=stock_schema(32),  # used only if file doesn't exist yet
                                 resume=True,
-                                compression="zstd")
-
+                                compression="zstd"),
+        stage_collection_with_schema(out_path="data/DailyCryptoData.parquet",
+                                     iter_chunks_fn=iter_crypto_chunks,
+                                     canonical_schema=crypto_schema(32),  # used only if file doesn't exist yet
+                                     resume=True,
+                                     compression="zstd"),
+        stage_collection_with_schema(out_path="data/DailyWeatherData.parquet",
+                                     iter_chunks_fn=iter_weather_chunks,
+                                     canonical_schema=weather_schema(32),  # used only if file doesn't exist yet
+                                     resume=True,
+                                     compression="zstd"),
+        stage_news(),
+        stage_collection_with_schema(out_path="data/DailyCurrencyExchangeRates.parquet",
+                                     iter_chunks_fn=iter_fx_chunks,
+                                     canonical_schema=fx_schema(32),  # used only if file doesn't exist yet
+                                     resume=True,
+                                     compression="zstd")
+    )"""
 
     stock  = pd.read_parquet("data/DailyStockData.parquet")
     crypto = pd.read_parquet("data/DailyCryptoData.parquet")
@@ -1510,6 +1511,6 @@ def main(args):
 if __name__ == "__main__":
     try:
         args = parse_args()
-        main(args)
+        asyncio.run(main(args))
     except Exception:
         logger.exception("An error occured during execution")
