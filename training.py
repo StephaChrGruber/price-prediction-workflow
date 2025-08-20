@@ -99,6 +99,7 @@ def add_calendar_targets(panel: pd.DataFrame, horizons_days: List[int]):
         panel[mcol] = panel[tcol].replace([np.inf,-np.inf], np.nan).notna().astype(int)
         tcols.append(tcol); mcols.append(mcol)
     logger.info(f"Added calendar targets: cols={tcols}")
+    panel = reduce_mem_usage(panel)
     return panel, tcols, mcols
 
 
@@ -118,6 +119,7 @@ def add_trading_targets(panel: pd.DataFrame, horizons_td: List[int]):
     panel2 = pd.concat(pieces).sort_values([SYMBOL_COL, TIME_COL])
     tcols = [f"target_td{h}" for h in horizons_td]; mcols = [f"mask_td{h}" for h in horizons_td]
     logger.info(f"Added trading targets: cols={tcols}")
+    panel2 = reduce_mem_usage(panel2)
     return panel2, tcols, mcols
 
 # ==========================
