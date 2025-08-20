@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 train_custom.py — Robust multi‑horizon forecaster (schemas adapted + NaN guards)
-==============================================================================
+============================================================================== 
 
 - Adapts to your Mongo collections with null‑tolerant loaders.
 - Uses safe logs, clamps, and NaN/Inf purging to avoid "Train nan | Val nan".
@@ -19,82 +19,58 @@ Run (example):
 
 """
 
-# --- diagnostics.py (top of training.py) ---
-import os, sys, time, signal, threading
-
-# 1) Always print tracebacks on crashes/timeouts
-import faulthandler
 from asyncio import as_completed
 from concurrent.futures import ProcessPoolExecutor, wait
 from datetime import datetime, timedelta
 import asyncio
 
-faulthandler.enable()
-# Dump stack on SIGTERM or when we poke SIGUSR1
-faulthandler.register(signal.SIGTERM, all_threads=True, chain=False)
-try:
-    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
-except Exception:
-    pass  # not all OSes have SIGUSR1
-
-# 2) Lightweight heartbeat so you see life signs in logs
-def heartbeat(msg="[hb] alive", every=30):
-    def _beat():
-        while True:
-            print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
-            time.sleep(every)
-    t = threading.Thread(target=_beat, daemon=True); t.start()
-heartbeat()
-
-# 3) Memory logger (RSS), helps spot growth before OOM
-try:
-    import psutil
-    def log_mem(tag):
-        rss = psutil.Process().memory_info().rss / (1024**3)
-        print(f"[mem] {tag}: rss={rss:.2f} GB", flush=True)
-except Exception:
-    def log_mem(tag): pass
-
-print(f"[boot] py={sys.version}")
-
-import logging
-import sys
-
-from pandas import DataFrame
-
-print(f"[boot] Python: {sys.version}")
-
-# Try import torch early so failures show before anything else
-try:
-    import torch
-    print(f"[boot] torch: {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
-except Exception as e:
-    print("[boot][FATAL] torch import failed:", e)
-    raise
-
-
-
-import os
-import copy
 import argparse
+import copy
+import logging
+import os
+import sys
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
+import polars as pl
+import pyarrow as pa
 from tqdm import tqdm
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import IncrementalPCA
 
+import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 import joblib
 
-from typing import Iterator, Optional, Dict, Any, Tuple
-from pymongo import MongoClient
-from bson import ObjectId
-import numpy as np, os
+from data_utils import (
+    mongo_client,
+    iter_mongo_df_chunks,
+    stage_collection_with_schema,
+    stage_collection,
+    align_df_to_schema,
+    sanitize_list_column,
+    table_from_df_and_schema,
+)
+from diagnostics import setup_diagnostics, log_mem, set_seed, safe_log
+from preprocessing import (
+    to_dt,
+    prep_stocks,
+    prep_crypto,
+    prep_fx,
+    prep_news_global,
+    prep_weather_daily,
+    merge_weather,
+    fit_weather_pca,
+    transform_weather_pca,
+)
+from constants import TIME_COL, SYMBOL_COL, EPS
+
+setup_diagnostics()
+print(f"[boot] torch: {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,498 +81,8 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# ==========================
-# Global constants / utils
-# ==========================
-TIME_COL = "date"
-SYMBOL_COL = "symbol"
-EPS = 1e-6
 
-def set_seed(seed: int = 42):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
-def safe_log(x: np.ndarray | pd.Series) -> np.ndarray:
-    a = np.asarray(x, dtype=float)
-    return np.log(np.clip(a, EPS, None))
-
-# ==========================
-# Mongo helpers
-# ==========================
-
-def mongo_client(uri: str) -> MongoClient:
-    return MongoClient(uri,compressors="zstd,snappy",             # if enabled on server
-    serverSelectionTimeoutMS=20_000,
-    socketTimeoutMS=600_000,
-    connectTimeoutMS=20_000,
-    maxPoolSize=8)
-
-def iter_mongo_df_chunks(
-    coll,
-    query: Optional[Dict[str, Any]] = None,
-    projection: Optional[Dict[str, int]] = None,
-    chunk_rows: int = 200_000,
-    batch_size_db: int = 5_000,
-    start_id: Optional[str] = None
-) -> Iterator[Tuple[pd.DataFrame, str]]:
-    query = dict(query or {})
-    projection = projection
-    last_id = ObjectId(start_id) if start_id else None
-
-    while True:
-        q = query.copy()
-        if last_id:
-            q["_id"] = {"$gt": last_id}
-
-        cur = (coll.find(q, projection)
-                 .sort([("_id", 1)])
-                 .limit(chunk_rows)
-                 .batch_size(batch_size_db))
-
-        docs = list(cur); cur.close()
-        if not docs:
-            break
-
-        last_id = docs[-1]["_id"]
-        for d in docs:
-            d.pop("_id", None)  # or keep str(d["_id"])
-
-        df = pd.DataFrame.from_records(docs).fillna(0.0)
-        yield df, str(last_id)
-
-def _load_coll(db, name: str, proj: Optional[dict] = None) -> pd.DataFrame:
-    if not proj:
-        cur = db[name].find({}, no_cursor_timeout=True)
-    else:
-        cur = db[name].find({}, proj, no_cursor_timeout=True)
-    if not cur:
-        return pd.DataFrame()
-
-    size = db[name].count_documents({})
-    docs = []
-    for d in tqdm(cur, desc=f"Loading documents from {name}", total=size):
-        docs.append(d)
-
-    if not docs or len(docs) == 0:
-        return pd.DataFrame()
-    df = pd.DataFrame(docs)
-    if "_id" in df.columns:
-        df = df.drop(columns=["_id"])
-    return df
-
-import pyarrow as pa, pyarrow.parquet as pq
-
-# --- map Arrow field -> pandas/numpy dtype we want to cast to ---
-def _arrow_field_to_pd_dtype(field: pa.Field):
-    t = field.type
-    if pa.types.is_timestamp(t):
-        return "datetime64[ns]"
-    if pa.types.is_string(t):
-        return "string"
-    if pa.types.is_float32(t):
-        return np.float32
-    if pa.types.is_float64(t):
-        return np.float64
-    if pa.types.is_int32(t):
-        return np.int32
-    if pa.types.is_int64(t):
-        return np.int64
-    # fallback: leave as-is
-    return None
-
-# --- align DataFrame to an Arrow schema (order + dtypes) ---
-def align_df_to_schema(df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
-    out = df.copy()
-
-    # 1) Ensure all schema columns exist (create nulls with correct dtype)
-    for field in schema:
-        name = field.name
-        if name not in out.columns:
-            if pa.types.is_timestamp(field.type):
-                out[name] = pd.Series([pd.NaT] * len(out), dtype="datetime64[ns]")
-            elif pa.types.is_string(field.type):
-                out[name] = pd.Series([None] * len(out), dtype="string")
-            elif pa.types.is_floating(field.type):
-                dt = _arrow_field_to_pd_dtype(field)
-                out[name] = pd.Series([np.nan] * len(out), dtype=dt)
-            elif pa.types.is_integer(field.type):
-                # use pandas nullable integer to allow NaN then cast later
-                out[name] = pd.Series([pd.NA] * len(out), dtype="Int64")
-            else:
-                out[name] = None
-
-    # 2) Drop extras not in schema
-    wanted = [f.name for f in schema]
-    out = out[wanted]  # <-- this also REORDERS columns to match schema
-
-    # 3) Cast each column to target dtype
-    for field in schema:
-        name = field.name
-        target = _arrow_field_to_pd_dtype(field)
-        try:
-            if target == "datetime64[ns]":
-                out[name] = pd.to_datetime(out[name], errors="coerce").astype("datetime64[ns]")
-            elif target == "string":
-                out[name] = out[name].astype("string")
-            elif target in (np.float32, np.float64):
-                out[name] = pd.to_numeric(out[name], errors="coerce").astype(target)
-            elif target in (np.int32, np.int64):
-                # to numeric, allow NaN → fill or keep NA, then cast
-                out[name] = pd.to_numeric(out[name], errors="coerce")
-                # choose behavior: keep NaN as 0 before cast, or use pandas nullable int
-                # here we keep NaN -> 0 to guarantee cast; tweak if you prefer NA
-                out[name] = out[name].fillna(0).astype(target)
-        except Exception as e:
-            print(f"[align] cast failed for column '{name}' to {target}: {e}")
-
-    return out
-
-# --- staging that respects existing file schema and enforces order ---
-async def stage_collection_with_schema(
-    out_path: str,
-    iter_chunks_fn,                 # callable(start_id) -> yields (df, last_id)
-    canonical_schema: pa.Schema|None = None,
-    resume: bool = True,
-    compression: str = "zstd",
-):
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    ckpt = out_path + ".ckpt"
-
-    # Determine target schema:
-    #   - If file exists, use its schema (order + dtypes).
-    #   - Else, use the provided canonical_schema (if any).
-    target_schema = None
-    if os.path.exists(out_path):
-        try:
-            target_schema = pq.ParquetFile(out_path).schema_arrow
-            print("[stage] Using existing file schema:", target_schema)
-        except Exception as e:
-            print("[stage] Cannot read existing schema:", e)
-
-    if target_schema is None:
-        target_schema = canonical_schema
-
-    # Resume checkpoint
-    start_id = None
-    if resume and os.path.exists(ckpt):
-        start_id = (open(ckpt).read().strip() or None)
-
-    writer = None
-    try:
-        for i, (df, last_id) in enumerate(iter_chunks_fn(start_id)):
-            # If we already know the schema (existing file or canonical), align now.
-            if target_schema is not None:
-                df = align_df_to_schema(df, target_schema)
-                table = pa.Table.from_pandas(df, preserve_index=False, schema=target_schema)
-            else:
-                # First chunk with no schema: infer from this chunk and freeze it
-                table = pa.Table.from_pandas(df, preserve_index=False)
-                target_schema = table.schema
-                # Re-align (guarantees consistent order for future chunks)
-                df = align_df_to_schema(df, target_schema)
-                table = pa.Table.from_pandas(df, preserve_index=False, schema=target_schema)
-
-            if writer is None:
-                writer = pq.ParquetWriter(out_path, target_schema, compression=compression)
-                print("[stage] Writer created with schema:", target_schema)
-
-            writer.write_table(table)
-            with open(ckpt, "w") as f:
-                f.write(last_id)
-            print(f"[stage] wrote chunk {i}, rows={len(df)}, checkpoint={last_id}")
-    finally:
-        if writer is not None:
-            writer.close()
-
-
-def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200_000):
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    ckpt = out_path + ".ckpt"
-
-    start_id = None
-    if os.path.exists(ckpt):
-        start_id = open(ckpt).read().strip() or None
-
-    writer = None
-    try:
-        for i, (df, last_id) in enumerate(iter_mongo_df_chunks(
-            coll, query=query, projection=projection, chunk_rows=chunk_rows
-        )):
-            log_mem(f"chunk {i} before write")
-
-            table = pa.Table.from_pandas(df, preserve_index=False)
-            schema = table.schema
-            if writer is None:
-                writer = pq.ParquetWriter(out_path, schema, compression="zstd")
-            writer.write_table(table)
-
-            with open(ckpt, "w") as f:
-                f.write(last_id)
-            print(f"[stage] wrote chunk {i}, rows={len(df)}")
-            log_mem(f"chunk {i} after write")
-    finally:
-        if writer: writer.close()
-
-
-# ==========================
-# Schema‑aware loaders
-# ==========================
-
-def to_dt(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce").dt.tz_localize(None)
-
-
-def prep_stocks(df: pd.DataFrame) -> pd.DataFrame:
-    logger.info("Preparing stocks")
-    if df.empty:
-        return df
-    d = df.copy()
-    for k in ["date","symbol","open","close","high","low","volume"]:
-        if k not in d.columns: d[k] = np.nan
-    d = d.rename(columns={"date": TIME_COL, "symbol": SYMBOL_COL})
-    d[TIME_COL] = to_dt(d[TIME_COL])
-    for c in ["open","close","high","low","volume"]:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d = d.dropna(subset=[TIME_COL, SYMBOL_COL])
-    d = d.sort_values([SYMBOL_COL, TIME_COL])
-    d["source"] = "stock"
-    return d[[SYMBOL_COL, TIME_COL, "open","close","high","low","volume","source"]]
-
-
-def prep_crypto(df: pd.DataFrame) -> pd.DataFrame:
-    logger.info("Preparing crypto")
-    if df.empty:
-        return df
-    d = df.copy()
-    for k in [
-        "date","symbol","open","high","low","close","volume",
-        "quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol",
-        "closePctChange","openPctChange",
-    ]:
-        if k not in d.columns: d[k] = np.nan
-    d = d.rename(columns={"date": TIME_COL, "symbol": SYMBOL_COL})
-    d[TIME_COL] = to_dt(d[TIME_COL])
-    for c in [
-        "open","high","low","close","volume","quote_asset_volume","num_trades",
-        "taker_buy_base_vol","taker_buy_quote_vol","closePctChange","openPctChange",
-    ]:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d = d.dropna(subset=[TIME_COL, SYMBOL_COL])
-    d = d.sort_values([SYMBOL_COL, TIME_COL])
-    d["source"] = "crypto"
-    return d[[
-        SYMBOL_COL, TIME_COL, "open","close","high","low","volume",
-        "quote_asset_volume","num_trades","taker_buy_base_vol","taker_buy_quote_vol",
-        "closePctChange","openPctChange","source"
-    ]]
-
-
-def prep_fx(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    DailyCurrencyExchangeRates: date, base_currency, dynamic currency codes (USD, JPY, ...).
-    Returns a 2-col frame: [date, eur_fx_logret] with the mean daily EUR log return across all rate columns.
-    Vectorized to avoid DataFrame fragmentation warnings.
-    """
-    logger.info("Preparing FX")
-    if df.empty:
-        return df
-
-    d = df.copy()
-    d[TIME_COL] = to_dt(d.get(TIME_COL, pd.Series(index=d.index)))
-    d = d.dropna(subset=[TIME_COL]).sort_values(TIME_COL)
-
-    # Dynamic rate columns = all except date/base_currency
-    rate_cols = [c for c in d.columns if c not in {TIME_COL, "base_currency"}]
-    if not rate_cols:
-        return pd.DataFrame({TIME_COL: d[TIME_COL].values, "eur_fx_logret": np.zeros(len(d), dtype=float)})
-
-    # Clean & clip all rate columns in one shot
-    rates = d[rate_cols].apply(pd.to_numeric, errors="coerce").ffill().bfill().fillna(1.0)
-    rates = rates.clip(lower=EPS)  # avoid log(0)
-
-    # Vectorized log-returns for all columns
-    log_rates = np.log(rates.to_numpy(dtype=float))                # shape: (T, N)
-    dlog = np.diff(log_rates, axis=0)                              # shape: (T-1, N)
-    dlog = np.vstack([np.zeros((1, dlog.shape[1]), dtype=float),   # prepend 0 for first row
-                      dlog])
-
-    # Mean across currencies per day
-    eur_fx_logret = np.nanmean(dlog, axis=1)
-    eur_fx_logret = np.where(np.isfinite(eur_fx_logret), eur_fx_logret, 0.0)
-
-    return pd.DataFrame({TIME_COL: d[TIME_COL].values, "eur_fx_logret": eur_fx_logret})
-
-
-def _extract_sentiment(val) -> float:
-    # sentiment is array inside array; outer length 1
-    if val is None:
-        return 0.0
-    try:
-        arr = np.array(val, dtype=float).flatten()
-        if arr.size == 0 or not np.isfinite(arr).any():
-            return 0.0
-        return float(np.nanmean(arr))
-    except Exception:
-        return 0.0
-
-
-def prep_news_global(df: pd.DataFrame, pca_cap: int = 32) -> pd.DataFrame:
-    logger.info("Preparing News")
-    if df.empty:
-        return df
-    d = df.copy()
-    d[TIME_COL] = to_dt(d.get(TIME_COL, pd.Series(index=d.index)))
-    d[TIME_COL] = d[TIME_COL].dt.normalize()
-    d = d.dropna(subset=[TIME_COL])
-    d["sentiment_scalar"] = d.get("sentiment", 0).apply(_extract_sentiment) if "sentiment" in d.columns else 0.0
-    def _to_vec(x):
-        try:
-            a = np.asarray(x, dtype=float).reshape(-1)
-            if a.size == 0 or not np.isfinite(a).any():
-                return np.empty((0,), dtype=float)
-            return a
-        except Exception:
-            return np.empty((0,), dtype=float)
-    d["emb_vec"] = d.get("embeddings", [[]]).apply(_to_vec) if "embeddings" in d.columns else [[]]
-
-    rows = []
-    for dt, g in d.groupby(TIME_COL):
-        logger.info(f"Preparing news data for date: {dt}")
-        sent_mean = float(np.nanmean(g["sentiment_scalar"].values)) if len(g) else 0.0
-        sent_max  = float(np.nanmax(g["sentiment_scalar"].values)) if len(g) else 0.0
-        cnt = int(len(g))
-        vecs = [v for v in g["emb_vec"].values if isinstance(v, np.ndarray) and v.size > 0]
-        E = np.vstack(vecs) if vecs else np.empty((0, 0))
-        rows.append({TIME_COL: dt, "news_sent_mean": sent_mean, "news_sent_max": sent_max, "news_count": cnt, "E": E})
-    agg = pd.DataFrame(rows)
-
-    if (not agg.empty) and agg["E"].apply(lambda a: isinstance(a, np.ndarray) and a.size > 0).any():
-        stacks = [a for a in agg["E"].values if isinstance(a, np.ndarray) and a.size > 0]
-        X = np.vstack(stacks)
-        comp_dim = min(pca_cap, X.shape[1])
-        ipca = IncrementalPCA(n_components=comp_dim)
-        chunk = 10000
-        for i in range(0, X.shape[0], chunk):
-            ipca.partial_fit(X[i:i+chunk])
-        def _reduce(a):
-            if not isinstance(a, np.ndarray) or a.size == 0:
-                return np.zeros(comp_dim, dtype=float)
-            return ipca.transform(a).mean(axis=0)
-        Z = agg["E"].apply(_reduce)
-        Zdf = pd.DataFrame(Z.tolist(), columns=[f"news_pca_{i}" for i in range(comp_dim)])
-        agg = pd.concat([agg.drop(columns=["E"]), Zdf], axis=1)
-    else:
-        for i in range(8): agg[f"news_pca_{i}"] = 0.0
-        agg = agg.drop(columns=["E"]) if "E" in agg.columns else agg
-
-    return agg
-
-# ==========================
-# Panel construction
-# ==========================
-
-def daily_calendar(prices: pd.DataFrame) -> pd.DatetimeIndex:
-    logger.info("Generating daily calendar")
-    first = prices[TIME_COL].min(); last = prices[TIME_COL].max()
-    return pd.date_range(first, last, freq="D")
-
-
-def add_time_feats(df: pd.DataFrame) -> pd.DataFrame:
-    df["dow"] = df[TIME_COL].dt.dayofweek
-    df["dom"] = df[TIME_COL].dt.day
-    df["month"] = df[TIME_COL].dt.month
-    return df
-
-
-def prepare_panel(stock_df, crypto_df, fx_df, news_df) -> Tuple[pd.DataFrame, Dict[str,int]]:
-    s = prep_stocks(stock_df); c = prep_crypto(crypto_df)
-    if s.empty and c.empty:
-        raise RuntimeError("No stock or crypto rows found.")
-    prices = pd.concat([s, c], ignore_index=True)
-
-    cal = daily_calendar(prices)
-    panel = process_all_symbols_parallel(prices, cal, 8)
-
-    # FX merge
-    fx_norm = prep_fx(fx_df)
-    panel = panel.merge(fx_norm, on=TIME_COL, how="left") if not fx_norm.empty else panel.assign(eur_fx_logret=0.0)
-
-    # Global news by date
-    newsg = prep_news_global(news_df)
-    if not newsg.empty:
-        panel = panel.merge(newsg, on=TIME_COL, how="left")
-    else:
-        panel["news_sent_mean"] = 0.0; panel["news_sent_max"] = 0.0; panel["news_count"] = 0
-        for i in range(8): panel[f"news_pca_{i}"] = 0.0
-
-    panel = add_time_feats(panel)
-
-    # Purge non-finite numerics (features only)
-    num_cols = panel.select_dtypes(include=[np.number]).columns
-    panel[num_cols] = panel[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    asset2id = {s: i for i, s in enumerate(sorted(panel[SYMBOL_COL].dropna().unique()))}
-    panel["asset_id"] = panel[SYMBOL_COL].map(asset2id).astype(int)
-    return panel, asset2id
-
-# ==========================
-# Weather → PCA → merge
-# ==========================
-
-def prep_weather_daily(weather_df: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:
-    logger.info("Preparing Weather")
-    if weather_df.empty: return pd.DataFrame(columns=[TIME_COL])
-    w = weather_df.copy(); w[TIME_COL] = to_dt(w.get(TIME_COL, pd.Series(index=w.index)))
-    w = w.dropna(subset=[TIME_COL])
-    wx_num = [c for c in ["tavg","tmin","tmax","prcp","snow","wdir","wspd","wpgt","pres","tsun"] if c in w.columns]
-    for c in tqdm(wx_num, desc="WX_Num"): w[c] = pd.to_numeric(w[c], errors="coerce")
-    logger.info("Grouping Weather")
-    if agg == "median": wagg = w.groupby(TIME_COL)[wx_num].median().reset_index()
-    else: wagg = w.groupby(TIME_COL)[wx_num].mean().reset_index()
-    logger.info("Sorting Weather")
-    wagg = wagg.sort_values(TIME_COL)
-    wagg = wagg.rename(columns={c: f"wx_{c}" for c in wx_num})
-    return wagg
-
-
-def fit_weather_pca(weather_daily: pd.DataFrame, n_components: int, fit_dates: Optional[List[pd.Timestamp]] = None):
-    wx_cols = [c for c in weather_daily.columns if c.startswith("wx_")]
-    if not wx_cols: return None, None, [], []
-    df = weather_daily.copy()
-    if fit_dates is not None:
-        df = df[df[TIME_COL].isin(pd.to_datetime(fit_dates))]
-        if df.empty: return None, None, wx_cols, []
-    sc = StandardScaler(); Xfit = sc.fit_transform(df[wx_cols].values)
-    pca = IncrementalPCA(n_components=min(n_components, Xfit.shape[1]))
-    for i in range(0, Xfit.shape[0], 20000): pca.partial_fit(Xfit[i:i+20000])
-    names = [f"wx_pca_{i}" for i in range(pca.n_components_)]
-    return pca, sc, wx_cols, names
-
-
-def transform_weather_pca(weather_daily: pd.DataFrame, pca, sc, wx_cols: List[str], names: List[str]):
-    if pca is None or not wx_cols:
-        out = weather_daily[[TIME_COL]].copy()
-        for n in names: out[n] = 0.0
-        return out
-    X = sc.transform(weather_daily[wx_cols].values); Z = pca.transform(X)
-    out = weather_daily[[TIME_COL]].copy()
-    for i, n in enumerate(names): out[n] = Z[:, i].astype(np.float32)
-    return out
-
-
-def merge_weather(panel: pd.DataFrame, weather_daily: pd.DataFrame, n_components: int, fit_dates: Optional[List[pd.Timestamp]] = None):
-    weather_daily = weather_daily.fillna(0.0)
-    if weather_daily.empty:
-        names = [f"wx_pca_{i}" for i in range(n_components)]
-        for n in names: panel[n] = 0.0
-        return panel, None, None, names
-    pca, sc, wx_cols, names = fit_weather_pca(weather_daily, n_components, fit_dates)
-    wxz = transform_weather_pca(weather_daily, pca, sc, wx_cols, names)
-    out = panel.merge(wxz, on=TIME_COL, how="left")
-    for n in names: out[n] = out[n].fillna(0.0)
-    return out, pca, sc, names
 
 # ==========================
 # Targets
@@ -1135,9 +621,60 @@ def process_all_symbols_parallel(prices: pd.DataFrame,
     return pd.concat(rows, ignore_index=True)
 
 # -------------------------------------------------
-# Usage inside your prepare_panel(...):
+# Panel preparation helpers
 
-# panel = process_all_symbols_parallel(prices, cal, max_workers=8)
+def daily_calendar(prices: pd.DataFrame) -> pd.DatetimeIndex:
+    logger.info("Generating daily calendar")
+    first = prices[TIME_COL].min()
+    last = prices[TIME_COL].max()
+    return pd.date_range(first, last, freq="D")
+
+
+def add_time_feats(df: pd.DataFrame) -> pd.DataFrame:
+    df["dow"] = df[TIME_COL].dt.dayofweek
+    df["dom"] = df[TIME_COL].dt.day
+    df["month"] = df[TIME_COL].dt.month
+    return df
+
+
+def prepare_panel(stock_df: pl.DataFrame,
+                  crypto_df: pl.DataFrame,
+                  fx_df: pl.DataFrame,
+                  news_df: pl.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    s = prep_stocks(stock_df)
+    c = prep_crypto(crypto_df)
+    s_pd = s.to_pandas() if hasattr(s, "to_pandas") else s
+    c_pd = c.to_pandas() if hasattr(c, "to_pandas") else c
+    if s_pd.empty and c_pd.empty:
+        raise RuntimeError("No stock or crypto rows found.")
+    prices = pd.concat([s_pd, c_pd], ignore_index=True)
+
+    cal = daily_calendar(prices)
+    panel = process_all_symbols_parallel(prices, cal, max_workers=8)
+
+    fx_norm = prep_fx(fx_df)
+    fx_pd = fx_norm.to_pandas() if hasattr(fx_norm, "to_pandas") else fx_norm
+    panel = panel.merge(fx_pd, on=TIME_COL, how="left") if not fx_pd.empty else panel.assign(eur_fx_logret=0.0)
+
+    newsg = prep_news_global(news_df)
+    news_pd = newsg.to_pandas() if hasattr(newsg, "to_pandas") else newsg
+    if not news_pd.empty:
+        panel = panel.merge(news_pd, on=TIME_COL, how="left")
+    else:
+        panel["news_sent_mean"] = 0.0
+        panel["news_sent_max"] = 0.0
+        panel["news_count"] = 0
+        for i in range(8):
+            panel[f"news_pca_{i}"] = 0.0
+
+    panel = add_time_feats(panel)
+
+    num_cols = panel.select_dtypes(include=[np.number]).columns
+    panel[num_cols] = panel[num_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    asset2id = {s: i for i, s in enumerate(sorted(panel[SYMBOL_COL].dropna().unique()))}
+    panel["asset_id"] = panel[SYMBOL_COL].map(asset2id).astype(int)
+    return panel, asset2id
 
 async def main(args):
     logger.info("[boot] starting main()")
