@@ -1,5 +1,6 @@
 import logging
 import os
+import gc
 from typing import Iterator, Optional, Dict, Any, Tuple
 
 import numpy as np
@@ -70,6 +71,9 @@ def iter_mongo_df_chunks(
     nan_to_null=True,           # turn NaN -> null on ingest
     strict=False,).fill_null(0.0)
         yield df, str(last_id)
+        del df
+        del docs
+        gc.collect()
 
 
 # -------------------------
@@ -158,6 +162,9 @@ async def stage_collection_with_schema(
         with open(ckpt, "w") as f:
             f.write(last_id)
         logger.info(f"[stage] wrote chunk {i}, rows={len(df)}, checkpoint={last_id}")
+        del table
+        del df
+        gc.collect()
 
 
 def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200_000):
@@ -179,6 +186,9 @@ def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200
         with open(ckpt, "w") as f:
             f.write(last_id)
         logger.info(f"[stage] wrote chunk {i}, rows={len(df)}")
+        del table
+        del df
+        gc.collect()
         log_mem(f"chunk {i} after write")
 
 

@@ -29,6 +29,7 @@ import copy
 import logging
 import os
 import sys
+import gc
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
@@ -868,6 +869,8 @@ async def main(args):
 
     logger.info("Preparing panel")
     panel, asset2id = prepare_panel(stock, crypto, fx, news)
+    del stock, crypto, fx, news
+    gc.collect()
 
     if args.use_trading_days:
         panel, TARGET_COLS, MASK_COLS = add_trading_targets(panel, HORIZONS)
@@ -875,6 +878,8 @@ async def main(args):
         panel, TARGET_COLS, MASK_COLS = add_calendar_targets(panel, HORIZONS)
 
     wx_daily = prep_weather_daily(wxraw, agg=args.weather_agg)
+    del wxraw
+    gc.collect()
 
     if not args.walk_forward or not args.fold_aware_weather_pca:
         panel, _, _, _ = merge_weather(panel, wx_daily, n_components=args.weather_pca, fit_dates=None)
@@ -917,6 +922,8 @@ async def main(args):
             logger.info(pred_df.head(20))
             persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
             save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
+            del Xtr, Xva, tr_ds, va_ds, tr_dl, va_dl, X_raw, M, A, Y, D, panel, wx_daily, model, scaler
+            gc.collect()
             return
         else:
             logger.info("Walking Forward")
@@ -948,8 +955,12 @@ async def main(args):
                     rank_col = f"pred_{args.rank_horizon}_logret"
                 pred_df = pred_df.sort_values(rank_col, ascending=False)
                 logger.info(f"\n{pred_df.head(20)}")
+                del Xtr, Xva, tr_ds, va_ds, tr_dl, va_dl
+                gc.collect()
             persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
             save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
+            del X_raw, M, A, Y, D, panel, wx_daily, model, scaler
+            gc.collect()
             return
     else:
         # fold-aware weather PCA
@@ -962,13 +973,16 @@ async def main(args):
         ] + [c for c in panel.columns if c.startswith("news_pca_")]
         Xb, Mb, Ab, Yb, Db = build_sequences_multi(panel, args.lookback, base_FEATURES, TARGET_COLS, MASK_COLS, True)
         if not len(Yb): raise RuntimeError("No training samples in base sequences.")
-        models, scalers = [], []
+        model = None
+        scaler = None
+        panel_wx_final = None
         H = len(HORIZONS)
         if args.use_quantiles: QUANTS = [float(x) for x in args.quantiles.split(",") if x]
         for i, (tr_idx, va_idx) in enumerate(walk_forward_splits(Db, args.train_span_days, args.val_span_days, args.step_days), 1):
             logger.info(f"\n[fold {i}] train={len(tr_idx)} val={len(va_idx)}")
             train_dates = pd.to_datetime(Db[tr_idx]).unique()
             panel_wx, _, _, _ = merge_weather(panel.copy(), wx_daily, n_components=args.weather_pca, fit_dates=train_dates)
+            panel_wx_final = panel_wx
             wx_cols = [c for c in panel_wx.columns if c.startswith("wx_pca_")]
             FEATURES = base_FEATURES + wx_cols
             Xr, Mr, Ar, Yr, Dr = build_sequences_multi(panel_wx, args.lookback, FEATURES, TARGET_COLS, MASK_COLS, True)
@@ -985,15 +999,18 @@ async def main(args):
                 model = PriceForecastMulti(Xtr.shape[-1], len(asset2id), H, args.hidden, args.layers, args.dropout)
                 model, best = train_point(model, tr_dl, va_dl, device, args.epochs, args.lr, args.weight_decay)
             logger.info(f"[fold {i}] best val: {best:.6f}")
-            models.append(model); scalers.append(scaler)
-        model, scaler = models[-1], scalers[-1]
-        pred_df = score_quant(panel_wx, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device) if args.use_quantiles else \
-                   score_point(panel_wx, FEATURES, scaler, model, HORIZONS, HLAB, device)
+            del panel_wx, Xr, Mr, Ar, Yr, Dr, Xtr, Xva, tr_ds, va_ds, tr_dl, va_dl
+            gc.collect()
+        pred_df = score_quant(panel_wx_final, FEATURES, scaler, model, HORIZONS, HLAB, QUANTS, device) if args.use_quantiles else \
+                   score_point(panel_wx_final, FEATURES, scaler, model, HORIZONS, HLAB, device)
+        del panel_wx_final
         rank_col = (f"pred_{args.rank_horizon}_p{int(args.rank_quantile*100)}_logret" if args.use_quantiles else f"pred_{args.rank_horizon}_logret")
         pred_df = pred_df.sort_values(rank_col, ascending=False)
         logger.info(pred_df.head(20))
         persist_topk_to_mongo(pred_df, args.mongo_uri, args.db, args.coll_pred, args.top_k)
         save_artifacts(model, scaler, asset2id, FEATURES, outdir=args.artifacts_dir)
+        del model, scaler, Xb, Mb, Ab, Yb, Db, panel, wx_daily
+        gc.collect()
         return
 
 
