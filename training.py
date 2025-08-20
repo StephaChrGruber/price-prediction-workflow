@@ -834,7 +834,7 @@ async def main(args):
             pa.field("ZMW", f), pa.field("ZWL", f),
         ])
 
-    """await asyncio.gather(stage_collection_with_schema(
+    await asyncio.gather(stage_collection_with_schema(
                                 out_path="data/DailyStockData.parquet",
                                 iter_chunks_fn=iter_stocks_chunks,
                                 canonical_schema=stock_schema(32),  # used only if file doesn't exist yet
@@ -856,7 +856,7 @@ async def main(args):
                                      canonical_schema=fx_schema(32),  # used only if file doesn't exist yet
                                      resume=True,
                                      compression="zstd")
-    )"""
+    )
 
     stock  = pl.read_parquet("data/DailyStockData.parquet")
     crypto = pl.read_parquet("data/DailyCryptoData.parquet")
