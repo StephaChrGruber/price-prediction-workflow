@@ -594,7 +594,8 @@ def _process_one_symbol(sym: str,
     except Exception as e:
         # If you have a cross-process safe logger, use it; else print
         logger.exception(f"[worker] symbol={sym} failed: {e}")
-        return pd.DataFrame(columns=[SYMBOL_COL, TIME_COL])  # empty
+        # Re-raise so the main process can also log the failure and skip the symbol
+        raise
 
 # --- orchestrate in parallel ---------------------
 def _process_one_symbol_star(args: Tuple[str, pd.DataFrame, pd.DatetimeIndex]) -> pd.DataFrame:
@@ -621,7 +622,11 @@ def process_all_symbols_parallel(
         fut_to_sym: Dict[object, str] = {}
         # submit at most ``max_workers`` tasks at a time to limit memory use
         for sym, grp in prices.groupby(SYMBOL_COL, sort=False):
-            fut = ex.submit(_process_one_symbol_star, (sym, grp.copy(), cal))
+            try:
+                fut = ex.submit(_process_one_symbol_star, (sym, grp.copy(), cal))
+            except Exception as e:
+                logger.exception(f"[main] failed to submit symbol={sym}: {e}")
+                continue
             fut_to_sym[fut] = sym
             if len(fut_to_sym) >= max_workers:
                 done, _ = wait(fut_to_sym.keys(), return_when=FIRST_COMPLETED)
