@@ -136,14 +136,51 @@ def build_sequences_multi(
 ):
     logger.info("Building sequences")
     panel = panel.sort_values([SYMBOL_COL, TIME_COL])
-    X, M, A, Y, D = [], [], [], [], []
     H = len(target_cols)
 
+    # ------------------------------------------------------------------
+    # First pass: count how many valid sequences we will generate so we
+    # can allocate the output arrays only once.  This avoids keeping
+    # per‑symbol feature arrays alive until stacking later, which was a
+    # major source of memory blow‑up.
+    # ------------------------------------------------------------------
+    total = 0
+    for _, g in panel.groupby(SYMBOL_COL, observed=False):
+        g = g.reset_index(drop=True)
+        targets_arr = g[target_cols].to_numpy(np.float32, copy=True)
+        masks_arr = g[mask_cols].to_numpy(int, copy=True)
+        mask_trading = g["is_trading_day"].to_numpy(bool, copy=True)
+        for t in range(lookback, len(g)):
+            y = targets_arr[t]
+            masks = masks_arr[t]
+            if require_all:
+                if not np.isfinite(y).all() or masks.sum() < H:
+                    continue
+            else:
+                if not np.isfinite(y).any():
+                    continue
+            if not mask_trading[t - lookback:t].any():
+                continue
+            total += 1
+        del targets_arr, masks_arr, mask_trading
+
+    logger.info(f"Total sequences to build: {total}")
+
+    # Allocate output arrays
+    X_Out = np.empty((total, lookback, len(features)), dtype=np.float32)
+    M_Out = np.empty((total, lookback), dtype=bool)
+    A_Out = np.empty((total,), dtype=np.int64)
+    Y_Out = np.empty((total, H), dtype=np.float32)
+    D_Out = np.empty((total,), dtype="datetime64[ns]")
+
+    # ------------------------------------------------------------------
+    # Second pass: actually populate the arrays.
+    # ------------------------------------------------------------------
+    idx = 0
     for sym, g in panel.groupby(SYMBOL_COL, observed=False):
         logger.info(f"Building sequence for [{sym}]")
         g = g.reset_index(drop=True)
 
-        # Convert to NumPy arrays once per symbol to minimise memory usage
         feat_arr = g[features].to_numpy(np.float32, copy=True)
         mask_trading = g["is_trading_day"].to_numpy(bool, copy=True)
         asset_ids = g["asset_id"].to_numpy(np.int64, copy=True)
@@ -166,22 +203,16 @@ def build_sequences_multi(
             if not win_mask.any():
                 continue
 
-            X.append(feat_arr[win_slice])
-            M.append(win_mask)
-            A.append(int(asset_ids[t - 1]))
-            Y.append(y)
-            D.append(dates_arr[t])
-    logger.info("Done Building sequences")
-    X_Out = np.stack(X) if X else np.zeros((0, lookback, len(features)), np.float32)
-    logger.info("Built X np stack")
-    M_Out= np.stack(M) if M else np.zeros((0, lookback), bool)
-    logger.info("Built M np stack")
-    A_Out = np.array(A, np.int64)
-    logger.info("Built A np stack")
-    Y_Out = np.stack(Y) if Y else np.zeros((0, H), np.float32)
-    logger.info("Built Y np stack")
-    D_Out = np.array(D, dtype="datetime64[ns]")
-    logger.info("Built D np stack")
+            X_Out[idx] = feat_arr[win_slice]
+            M_Out[idx] = win_mask
+            A_Out[idx] = int(asset_ids[t - 1])
+            Y_Out[idx] = y
+            D_Out[idx] = dates_arr[t]
+            idx += 1
+
+        # explicit cleanup of large arrays for each symbol
+        del feat_arr, mask_trading, asset_ids, targets_arr, masks_arr, dates_arr
+
     logger.info(f"Built sequences: X={X_Out.shape} Y={Y_Out.shape}")
     return X_Out, M_Out, A_Out, Y_Out, D_Out
 
