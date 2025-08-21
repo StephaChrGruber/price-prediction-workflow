@@ -214,6 +214,53 @@ def stage_collection(coll, out_path, query=None, projection=None, chunk_rows=200
     logger.info(f"[stage] completed staging to {out_path}")
 
 
+def stream_parquet_process(
+    in_path: str,
+    out_path: str,
+    process_fn,
+    *,
+    chunk_rows: int = 200_000,
+    compression: str = "zstd",
+):
+    """Stream ``in_path`` in ``chunk_rows`` batches, apply ``process_fn`` and write.
+
+    This utility reads a potentially huge Parquet file without loading it entirely
+    into memory.  Each chunk is converted to a ``polars`` ``DataFrame``, passed to
+    ``process_fn`` and appended to ``out_path``.
+
+    Parameters
+    ----------
+    in_path:
+        Source Parquet file.
+    out_path:
+        Destination Parquet file.  Will be overwritten.
+    process_fn:
+        Callable that accepts and returns a ``pl.DataFrame``.
+    chunk_rows:
+        Approximate number of rows to process per batch.
+    compression:
+        Compression codec used for the output Parquet file.
+    """
+
+    logger.info(f"[stream] {in_path} -> {out_path} (rows/batch={chunk_rows})")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    pf = pq.ParquetFile(in_path)
+    writer = None
+    for i, batch in enumerate(pf.iter_batches(batch_size=chunk_rows)):
+        df = pl.from_arrow(batch)
+        df = process_fn(df)
+        tbl = df.to_arrow()
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, tbl.schema, compression=compression)
+        writer.write_table(tbl)
+        logger.info(f"[stream] wrote chunk {i} rows={len(df)}")
+        del df, tbl, batch
+        gc.collect()
+    if writer:
+        writer.close()
+    logger.info(f"[stream] completed streaming to {out_path}")
+
+
 # -------------------------
 # Misc helpers
 # -------------------------
