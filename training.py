@@ -145,7 +145,8 @@ def build_sequences_multi(
     # major source of memory blow‑up.
     # ------------------------------------------------------------------
     total = 0
-    for _, g in panel.groupby(SYMBOL_COL, observed=False):
+    for sym, g in panel.groupby(SYMBOL_COL, observed=False):
+        logger.info(f"Processing symbol {sym}")
         g = g.reset_index(drop=True)
         targets_arr = g[target_cols].to_numpy(np.float32, copy=True)
         masks_arr = g[mask_cols].to_numpy(int, copy=True)

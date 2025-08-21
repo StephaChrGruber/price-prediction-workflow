@@ -9,3 +9,7 @@ pyarrow
 dnnlib-util
 zstandard
 python-snappy
+pytorch
+tensor
+torch
+joblib
