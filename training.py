@@ -56,6 +56,7 @@ from data_utils import (
     align_df_to_schema,
     sanitize_list_column,
     table_from_df_and_schema,
+    stream_parquet_process,
 )
 from diagnostics import setup_diagnostics, log_mem, set_seed, safe_log
 from preprocessing import (
@@ -742,10 +743,8 @@ def prepare_panel(stock_df: pl.DataFrame,
                   fx_df: pl.DataFrame,
                   news_df: pl.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
     logger.info("Preparing panel data")
-    s = prep_stocks(stock_df)
-    c = prep_crypto(crypto_df)
-    s_pd = reduce_mem_usage(s.to_pandas() if hasattr(s, "to_pandas") else s, sparse_threshold=0.9)
-    c_pd = reduce_mem_usage(c.to_pandas() if hasattr(c, "to_pandas") else c, sparse_threshold=0.9)
+    s_pd = reduce_mem_usage(stock_df.to_pandas() if hasattr(stock_df, "to_pandas") else stock_df, sparse_threshold=0.9)
+    c_pd = reduce_mem_usage(crypto_df.to_pandas() if hasattr(crypto_df, "to_pandas") else crypto_df, sparse_threshold=0.9)
     if s_pd.empty and c_pd.empty:
         raise RuntimeError("No stock or crypto rows found.")
     prices = reduce_mem_usage(pd.concat([s_pd, c_pd], ignore_index=True), sparse_threshold=0.9)
@@ -1026,8 +1025,21 @@ async def main(args):
                                      compression="zstd")
     )
 
-    stock  = pl.read_parquet("data/DailyStockData.parquet")
-    crypto = pl.read_parquet("data/DailyCryptoData.parquet")
+    stream_parquet_process(
+        "data/DailyStockData.parquet",
+        "data/DailyStockData.prepped.parquet",
+        prep_stocks,
+        chunk_rows=100_000,
+    )
+    stream_parquet_process(
+        "data/DailyCryptoData.parquet",
+        "data/DailyCryptoData.prepped.parquet",
+        prep_crypto,
+        chunk_rows=100_000,
+    )
+
+    stock  = pl.read_parquet("data/DailyStockData.prepped.parquet")
+    crypto = pl.read_parquet("data/DailyCryptoData.prepped.parquet")
     fx     = pl.read_parquet("data/DailyCurrencyExchangeRates.parquet")
     news   = pl.read_parquet("data/NewsHeadlines.parquet")
     wxraw  = pl.read_parquet("data/DailyWeatherData.parquet")
