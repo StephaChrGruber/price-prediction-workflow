@@ -1017,6 +1017,9 @@ async def main(args):
         if not len(Y):
             raise RuntimeError("No training samples after sequence build; reduce lookback or check targets.")
         quick_nan_report(X_raw, "X_raw before scaling")
+        # Replace any non-finite values produced upstream so downstream
+        # scalers don't error out. This operates in-place to avoid copies.
+        np.nan_to_num(X_raw, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         if not args.walk_forward:
             logger.info("Not Walking Forward")
             tr_idx, va_idx = time_split_idx(len(Y), args.val_ratio)
@@ -1093,6 +1096,8 @@ async def main(args):
         ] + [c for c in panel.columns if c.startswith("news_pca_")]
         Xb, Mb, Ab, Yb, Db = build_sequences_multi(panel, args.lookback, base_FEATURES, TARGET_COLS, MASK_COLS, True)
         if not len(Yb): raise RuntimeError("No training samples in base sequences.")
+        quick_nan_report(Xb, "Xb before scaling")
+        np.nan_to_num(Xb, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         model = None
         scaler = None
         panel_wx_final = None
@@ -1106,6 +1111,8 @@ async def main(args):
             wx_cols = [c for c in panel_wx.columns if c.startswith("wx_pca_")]
             FEATURES = base_FEATURES + wx_cols
             Xr, Mr, Ar, Yr, Dr = build_sequences_multi(panel_wx, args.lookback, FEATURES, TARGET_COLS, MASK_COLS, True)
+            quick_nan_report(Xr, "Xr before scaling")
+            np.nan_to_num(Xr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
             tr2, va2 = next(walk_forward_splits(Dr, args.train_span_days, args.val_span_days, args.step_days))
             scaler = fit_scaler_on_train(Xr[tr2])
             Xtr, Xva = apply_scaler(Xr[tr2], scaler), apply_scaler(Xr[va2], scaler)
