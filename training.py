@@ -219,6 +219,146 @@ def build_sequences_multi(
     return X_Out, M_Out, A_Out, Y_Out, D_Out
 
 
+def _build_sequences_for_symbol(
+    g: pd.DataFrame,
+    lookback: int,
+    features: List[str],
+    target_cols: List[str],
+    mask_cols: List[str],
+    require_all: bool,
+    H: int,
+):
+    """Build sequences for a single symbol ``DataFrame``.
+
+    This helper avoids a double pass over the data so it can be used in
+    streaming scenarios where only a subset of the panel is available in
+    memory.  It mirrors the logic used in :func:`build_sequences_multi` but
+    operates on one symbol at a time and returns arrays sized exactly to the
+    number of valid sequences for that symbol.
+    """
+
+    feat_arr = g[features].to_numpy(np.float32, copy=True)
+    mask_trading = g["is_trading_day"].to_numpy(bool, copy=True)
+    asset_ids = g["asset_id"].to_numpy(np.int64, copy=True)
+    targets_arr = g[target_cols].to_numpy(np.float32, copy=True)
+    masks_arr = g[mask_cols].to_numpy(int, copy=True)
+    dates_arr = pd.to_datetime(g[TIME_COL]).to_numpy("datetime64[ns]")
+
+    X_list: List[np.ndarray] = []
+    M_list: List[np.ndarray] = []
+    A_list: List[int] = []
+    Y_list: List[np.ndarray] = []
+    D_list: List[np.datetime64] = []
+
+    for t in range(lookback, len(g)):
+        y = targets_arr[t]
+        masks = masks_arr[t]
+        if require_all:
+            if not np.isfinite(y).all() or masks.sum() < H:
+                continue
+        else:
+            if not np.isfinite(y).any():
+                continue
+
+        win_slice = slice(t - lookback, t)
+        win_mask = mask_trading[win_slice]
+        if not win_mask.any():
+            continue
+
+        X_list.append(feat_arr[win_slice])
+        M_list.append(win_mask)
+        A_list.append(int(asset_ids[t - 1]))
+        Y_list.append(y)
+        D_list.append(dates_arr[t])
+
+    if not X_list:
+        return (
+            np.empty((0, lookback, len(features)), dtype=np.float32),
+            np.empty((0, lookback), dtype=bool),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0, H), dtype=np.float32),
+            np.empty((0,), dtype="datetime64[ns]"),
+        )
+
+    X = np.stack(X_list)
+    M = np.stack(M_list)
+    A = np.asarray(A_list, dtype=np.int64)
+    Y = np.stack(Y_list)
+    D = np.asarray(D_list, dtype="datetime64[ns]")
+    return X, M, A, Y, D
+
+
+def build_sequences_multi_from_file(
+    path: str,
+    lookback: int,
+    features: List[str],
+    target_cols: List[str],
+    mask_cols: List[str],
+    *,
+    batch_rows: int = 200_000,
+    require_all: bool = True,
+):
+    """Stream ``path`` in ``batch_rows`` chunks and yield built sequences.
+
+    This generator addresses memory issues by reading a Parquet file in
+    manageable batches and constructing sequences incrementally.  It carries
+    the last ``lookback`` rows for each symbol between batches to ensure
+    windows that span chunk boundaries are generated correctly.
+
+    Parameters
+    ----------
+    path:
+        Path to a Parquet file containing the panel data sorted by symbol and
+        time.
+    lookback, features, target_cols, mask_cols, require_all:
+        See :func:`build_sequences_multi`.
+    batch_rows:
+        Approximate number of rows to load per Parquet batch.
+
+    Yields
+    ------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        Same arrays as :func:`build_sequences_multi` but for a subset of the
+        data.
+    """
+
+    H = len(target_cols)
+    pf = pq.ParquetFile(path)
+    carry: pd.DataFrame | None = None
+
+    for batch in pf.iter_batches(batch_size=batch_rows):
+        df = batch.to_pandas()
+        if carry is not None and len(carry):
+            df = pd.concat([carry, df], ignore_index=True)
+        df = df.sort_values([SYMBOL_COL, TIME_COL])
+
+        carry_parts = []
+        seq_parts = []
+        for sym, g in df.groupby(SYMBOL_COL, sort=False):
+            g = g.reset_index(drop=True)
+            if len(g) <= lookback:
+                carry_parts.append(g)
+                continue
+            X, M, A, Y, D = _build_sequences_for_symbol(
+                g, lookback, features, target_cols, mask_cols, require_all, H
+            )
+            if len(X):
+                seq_parts.append((X, M, A, Y, D))
+            carry_parts.append(g.iloc[-lookback:].copy())
+
+        carry = pd.concat(carry_parts, ignore_index=True) if carry_parts else None
+
+        if seq_parts:
+            yield (
+                np.concatenate([p[0] for p in seq_parts], axis=0),
+                np.concatenate([p[1] for p in seq_parts], axis=0),
+                np.concatenate([p[2] for p in seq_parts], axis=0),
+                np.concatenate([p[3] for p in seq_parts], axis=0),
+                np.concatenate([p[4] for p in seq_parts], axis=0),
+            )
+
+
+
 def time_split_idx(n: int, val_ratio: float = 0.2):
     logger.info(f"Creating time split n={n} val_ratio={val_ratio}")
     val_n = int(n * val_ratio)
