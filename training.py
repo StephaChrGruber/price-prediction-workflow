@@ -138,7 +138,8 @@ def build_sequences_multi(
     X, M, A, Y, D = [], [], [], [], []
     H = len(target_cols)
 
-    for sym, g in panel.groupby(SYMBOL_COL):
+    for sym, g in panel.groupby(SYMBOL_COL, observed=False):
+        if sym == "nan": continue
         logger.info(f"Building sequence for [{sym}]")
         g = g.reset_index(drop=True)
 
