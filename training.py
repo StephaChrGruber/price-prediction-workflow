@@ -98,7 +98,7 @@ def add_calendar_targets(panel: pd.DataFrame, horizons_days: List[int]):
         panel[mcol] = panel[tcol].replace([np.inf,-np.inf], np.nan).notna().astype(int)
         tcols.append(tcol); mcols.append(mcol)
     logger.info(f"Added calendar targets: cols={tcols}")
-    panel = reduce_mem_usage(panel)
+    panel = reduce_mem_usage(panel, sparse_threshold=0.9)
     return panel, tcols, mcols
 
 
@@ -118,7 +118,7 @@ def add_trading_targets(panel: pd.DataFrame, horizons_td: List[int]):
     panel2 = pd.concat(pieces).sort_values([SYMBOL_COL, TIME_COL])
     tcols = [f"target_td{h}" for h in horizons_td]; mcols = [f"mask_td{h}" for h in horizons_td]
     logger.info(f"Added trading targets: cols={tcols}")
-    panel2 = reduce_mem_usage(panel2)
+    panel2 = reduce_mem_usage(panel2, sparse_threshold=0.9)
     return panel2, tcols, mcols
 
 # ==========================
@@ -679,11 +679,11 @@ def prepare_panel(stock_df: pl.DataFrame,
     logger.info("Preparing panel data")
     s = prep_stocks(stock_df)
     c = prep_crypto(crypto_df)
-    s_pd = reduce_mem_usage(s.to_pandas() if hasattr(s, "to_pandas") else s)
-    c_pd = reduce_mem_usage(c.to_pandas() if hasattr(c, "to_pandas") else c)
+    s_pd = reduce_mem_usage(s.to_pandas() if hasattr(s, "to_pandas") else s, sparse_threshold=0.9)
+    c_pd = reduce_mem_usage(c.to_pandas() if hasattr(c, "to_pandas") else c, sparse_threshold=0.9)
     if s_pd.empty and c_pd.empty:
         raise RuntimeError("No stock or crypto rows found.")
-    prices = reduce_mem_usage(pd.concat([s_pd, c_pd], ignore_index=True))
+    prices = reduce_mem_usage(pd.concat([s_pd, c_pd], ignore_index=True), sparse_threshold=0.9)
     del s_pd, c_pd
     gc.collect()
 
@@ -694,13 +694,13 @@ def prepare_panel(stock_df: pl.DataFrame,
 
     fx_norm = prep_fx(fx_df)
 
-    fx_pd = reduce_mem_usage(fx_norm.to_pandas() if hasattr(fx_norm, "to_pandas") else fx_norm)
+    fx_pd = reduce_mem_usage(fx_norm.to_pandas() if hasattr(fx_norm, "to_pandas") else fx_norm, sparse_threshold=0.9)
     panel = panel.merge(fx_pd, on=TIME_COL, how="left") if not fx_pd.empty else panel.assign(eur_fx_logret=0.0)
     del fx_pd
     gc.collect()
 
     newsg = prep_news_global(news_df)
-    news_pd = reduce_mem_usage(newsg.to_pandas() if hasattr(newsg, "to_pandas") else newsg)
+    news_pd = reduce_mem_usage(newsg.to_pandas() if hasattr(newsg, "to_pandas") else newsg, sparse_threshold=0.9)
     if not news_pd.empty:
         panel = panel.merge(news_pd, on=TIME_COL, how="left")
     else:
@@ -713,7 +713,7 @@ def prepare_panel(stock_df: pl.DataFrame,
     gc.collect()
 
     panel = add_time_feats(panel)
-    panel = reduce_mem_usage(panel)
+    panel = reduce_mem_usage(panel, sparse_threshold=0.9)
 
     num_cols = panel.select_dtypes(include=[np.number]).columns
     panel[num_cols] = (
