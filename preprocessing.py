@@ -158,13 +158,32 @@ def prep_news_global(df: pl.DataFrame, pca_cap: int = 32) -> pl.DataFrame:
     max_dim = max(d["emb"].map_elements(len).max(), 0)
     dim = min(max_dim, pca_cap)
     if dim:
-        emb_mat = np.vstack([v[:dim] for v in d["emb"].to_list()])
+        def _pad(vec: np.ndarray) -> np.ndarray:
+            arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+            if arr.size >= dim:
+                return arr[:dim]
+            out = np.zeros(dim, dtype=np.float32)
+            out[: arr.size] = arr
+            return out
+
         pca = IncrementalPCA(n_components=dim)
-        for i in range(0, emb_mat.shape[0], 1000):
-            pca.partial_fit(emb_mat[i : i + 1000])
-        Z = pca.transform(emb_mat)
-        for i in range(dim):
-            d = d.with_columns(pl.Series(f"news_pca_{i}", Z[:, i].astype(np.float32)))
+        batch = 1000
+        for i in range(0, len(d), batch):
+            part = np.vstack([_pad(v) for v in d["emb"].slice(i, batch).to_list()])
+            if part.size:
+                pca.partial_fit(part)
+
+        cols = [np.zeros(len(d), dtype=np.float32) for _ in range(dim)]
+        for i in range(0, len(d), batch):
+            part = np.vstack([_pad(v) for v in d["emb"].slice(i, batch).to_list()])
+            if not part.size:
+                continue
+            Z = pca.transform(part).astype(np.float32)
+            for j in range(dim):
+                cols[j][i : i + len(Z)] = Z[:, j]
+        d = d.with_columns(
+            [pl.Series(f"news_pca_{j}", cols[j]) for j in range(dim)]
+        )
 
     agg_expr = [
         pl.col("sentiment_scalar").mean().alias("news_sent_mean"),
