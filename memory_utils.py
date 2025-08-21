@@ -39,7 +39,12 @@ def _downcast_int(series: pd.Series) -> pd.Series:
     return series.astype(np.int64)
 
 
-def reduce_mem_usage(df: pd.DataFrame, *, cat_threshold: float = 0.5) -> pd.DataFrame:
+def reduce_mem_usage(
+    df: pd.DataFrame,
+    *,
+    cat_threshold: float = 0.5,
+    sparse_threshold: float | None = None,
+) -> pd.DataFrame:
     """Downcast numeric columns and optionally convert objects to categories.
 
     Parameters
@@ -49,6 +54,10 @@ def reduce_mem_usage(df: pd.DataFrame, *, cat_threshold: float = 0.5) -> pd.Data
     cat_threshold:
         Convert an ``object`` column to ``category`` if its number of unique
         values divided by the total number of rows is below this threshold.
+    sparse_threshold:
+        If provided, convert numeric and boolean columns with a fraction of
+        zeros (or ``False``) greater than or equal to this value into
+        ``pd.SparseDtype`` with ``fill_value=0``.
 
     Returns
     -------
@@ -68,22 +77,42 @@ def reduce_mem_usage(df: pd.DataFrame, *, cat_threshold: float = 0.5) -> pd.Data
         col_type = col_data.dtype
 
         if ptypes.is_bool_dtype(col_type):
-            df[col] = col_data.astype(bool)
+            dc = col_data.astype(bool)
+            if sparse_threshold is not None and ((dc == False).mean() >= sparse_threshold):
+                df[col] = dc.astype(pd.SparseDtype(bool, False))
+            else:
+                df[col] = dc
         elif ptypes.is_integer_dtype(col_type):
             if col_data.dropna().isin([0, 1]).all():
-                df[col] = col_data.astype(bool)
+                dc = col_data.astype(bool)
+                if sparse_threshold is not None and ((dc == False).mean() >= sparse_threshold):
+                    df[col] = dc.astype(pd.SparseDtype(bool, False))
+                else:
+                    df[col] = dc
             else:
-                df[col] = _downcast_int(col_data)
+                dc = _downcast_int(col_data)
+                if sparse_threshold is not None and ((dc == 0).mean() >= sparse_threshold):
+                    df[col] = dc.astype(pd.SparseDtype(dc.dtype, 0))
+                else:
+                    df[col] = dc
         elif ptypes.is_float_dtype(col_type):
             col_no_na = col_data.dropna()
             if not col_data.isna().any() and (col_no_na == col_no_na.astype(np.int64)).all():
-                df[col] = _downcast_int(col_data.astype(np.int64))
+                dc = _downcast_int(col_data.astype(np.int64))
             else:
-                df[col] = _downcast_float(col_data)
+                dc = _downcast_float(col_data)
+            if sparse_threshold is not None and ((dc == 0).mean() >= sparse_threshold):
+                df[col] = dc.astype(pd.SparseDtype(dc.dtype, 0.0))
+            else:
+                df[col] = dc
         elif ptypes.is_object_dtype(col_type):
             num_unique = col_data.nunique(dropna=False)
             if col_data.dropna().isin([0, 1, "0", "1", True, False, "True", "False"]).all():
-                df[col] = col_data.map({"0": False, "1": True, 0: False, 1: True, "True": True, "False": False}).astype(bool)
+                dc = col_data.map({"0": False, "1": True, 0: False, 1: True, "True": True, "False": False}).astype(bool)
+                if sparse_threshold is not None and ((dc == False).mean() >= sparse_threshold):
+                    df[col] = dc.astype(pd.SparseDtype(bool, False))
+                else:
+                    df[col] = dc
             elif num_unique / len(col_data) <= cat_threshold:
                 df[col] = col_data.astype("category")
 
