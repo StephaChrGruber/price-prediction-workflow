@@ -125,7 +125,14 @@ def add_trading_targets(panel: pd.DataFrame, horizons_td: List[int]):
 # Sequences / scaling / splits
 # ==========================
 
-def build_sequences_multi(panel: pd.DataFrame, lookback: int, features: List[str], target_cols: List[str], mask_cols: List[str], require_all: bool = True):
+def build_sequences_multi(
+    panel: pd.DataFrame,
+    lookback: int,
+    features: List[str],
+    target_cols: List[str],
+    mask_cols: List[str],
+    require_all: bool = True,
+):
     logger.info("Building sequences")
     panel = panel.sort_values([SYMBOL_COL, TIME_COL])
     X, M, A, Y, D = [], [], [], [], []
@@ -134,33 +141,41 @@ def build_sequences_multi(panel: pd.DataFrame, lookback: int, features: List[str
     for sym, g in panel.groupby(SYMBOL_COL):
         logger.info(f"Building sequence for [{sym}]")
         g = g.reset_index(drop=True)
+
+        # Convert to NumPy arrays once per symbol to minimise memory usage
+        feat_arr = g[features].to_numpy(np.float32, copy=True)
+        mask_trading = g["is_trading_day"].to_numpy(bool, copy=True)
+        asset_ids = g["asset_id"].to_numpy(np.int64, copy=True)
+        targets_arr = g[target_cols].to_numpy(np.float32, copy=True)
+        masks_arr = g[mask_cols].to_numpy(int, copy=True)
+        dates_arr = pd.to_datetime(g[TIME_COL]).to_numpy("datetime64[ns]")
+
         for t in range(lookback, len(g)):
-            y = g.loc[t, target_cols].values.astype(np.float32)
-            masks = g.loc[t, mask_cols].values.astype(int)
+            y = targets_arr[t]
+            masks = masks_arr[t]
             if require_all:
                 if not np.isfinite(y).all() or masks.sum() < H:
                     continue
             else:
                 if not np.isfinite(y).any():
                     continue
-            win = g.iloc[t - lookback : t]
-            if len(win) < lookback:
+
+            win_slice = slice(t - lookback, t)
+            win_mask = mask_trading[win_slice]
+            if not win_mask.any():
                 continue
 
-            mask_win = win["is_trading_day"].values.astype(bool)
-            if not mask_win.any():
-                continue
-
-            X.append(win[features].values.astype(np.float32))
-            M.append(win["is_trading_day"].values.astype(bool))
-            A.append(int(win["asset_id"].iloc[-1]))
+            X.append(feat_arr[win_slice])
+            M.append(win_mask)
+            A.append(int(asset_ids[t - 1]))
             Y.append(y)
-            D.append(pd.Timestamp(g.loc[t, TIME_COL]).to_datetime64())
-    X = np.stack(X) if len(X) else np.zeros((0, lookback, len(features)), np.float32)
-    M = np.stack(M) if len(M) else np.zeros((0, lookback), bool)
+            D.append(dates_arr[t])
+
+    X = np.stack(X) if X else np.zeros((0, lookback, len(features)), np.float32)
+    M = np.stack(M) if M else np.zeros((0, lookback), bool)
     A = np.array(A, np.int64)
-    Y = np.stack(Y) if len(Y) else np.zeros((0, H), np.float32)
-    D = np.array(D)
+    Y = np.stack(Y) if Y else np.zeros((0, H), np.float32)
+    D = np.array(D, dtype="datetime64[ns]")
     logger.info(f"Built sequences: X={X.shape} Y={Y.shape}")
     return X, M, A, Y, D
 
