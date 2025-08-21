@@ -19,7 +19,7 @@ Run (example):
 
 """
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 import asyncio
 
@@ -602,31 +602,43 @@ def _process_one_symbol_star(args: Tuple[str, pd.DataFrame, pd.DatetimeIndex]) -
     return _process_one_symbol(*args)
 
 
-def process_all_symbols_parallel(prices: pd.DataFrame,
-                                 cal: pd.DatetimeIndex,
-                                 max_workers: int | None = None) -> pd.DataFrame:
+def process_all_symbols_parallel(
+    prices: pd.DataFrame,
+    cal: pd.DatetimeIndex,
+    max_workers: int | None = None,
+) -> pd.DataFrame:
     """Parallelize per-symbol processing with a process pool.
 
-    This implementation streams tasks to the worker pool instead of materialising
-    all symbol dataframes in memory at once.  The previous approach built a full
-    list of ``(symbol, dataframe)`` pairs and spawned a nested process pool which
-    doubled the number of workers and significantly increased peak RAM usage.
+    Any symbol that raises an exception during processing is logged and skipped
+    so that a single bad symbol does not abort the entire workflow.
     """
 
     max_workers = max_workers or max(1, (os.cpu_count() or 2) - 1)
     logger.info(f"Processing {prices[SYMBOL_COL].nunique()} symbols in parallel")
 
-    # Stream each symbol's dataframe to the executor to avoid duplicating them in
-    # memory.  ``chunksize=1`` ensures at most ``max_workers`` frames are held at
-    # once.
-    def task_iter():
-        for sym, grp in prices.groupby(SYMBOL_COL, sort=False):
-            yield sym, grp.copy(), cal
-
     rows: List[pd.DataFrame] = []
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        for res in ex.map(_process_one_symbol_star, task_iter(), chunksize=1):
-            rows.append(res)
+        fut_to_sym: Dict[object, str] = {}
+        # submit at most ``max_workers`` tasks at a time to limit memory use
+        for sym, grp in prices.groupby(SYMBOL_COL, sort=False):
+            fut = ex.submit(_process_one_symbol_star, (sym, grp.copy(), cal))
+            fut_to_sym[fut] = sym
+            if len(fut_to_sym) >= max_workers:
+                done, _ = wait(fut_to_sym.keys(), return_when=FIRST_COMPLETED)
+                for d in done:
+                    sym_d = fut_to_sym.pop(d)
+                    try:
+                        rows.append(d.result())
+                    except Exception as e:
+                        logger.exception(f"[main] symbol={sym_d} failed: {e}")
+
+        # drain any remaining futures
+        for fut in as_completed(fut_to_sym):
+            sym = fut_to_sym[fut]
+            try:
+                rows.append(fut.result())
+            except Exception as e:
+                logger.exception(f"[main] symbol={sym} failed: {e}")
 
     if not rows:
         logger.info("No rows returned from parallel processing")
