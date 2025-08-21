@@ -170,14 +170,19 @@ def build_sequences_multi(
             A.append(int(asset_ids[t - 1]))
             Y.append(y)
             D.append(dates_arr[t])
-
-    X = np.stack(X) if X else np.zeros((0, lookback, len(features)), np.float32)
-    M = np.stack(M) if M else np.zeros((0, lookback), bool)
-    A = np.array(A, np.int64)
-    Y = np.stack(Y) if Y else np.zeros((0, H), np.float32)
-    D = np.array(D, dtype="datetime64[ns]")
-    logger.info(f"Built sequences: X={X.shape} Y={Y.shape}")
-    return X, M, A, Y, D
+    logger.info("Done Building sequences")
+    X_Out = np.stack(X) if X else np.zeros((0, lookback, len(features)), np.float32)
+    logger.info("Built X np stack")
+    M_Out= np.stack(M) if M else np.zeros((0, lookback), bool)
+    logger.info("Built M np stack")
+    A_Out = np.array(A, np.int64)
+    logger.info("Built A np stack")
+    Y_Out = np.stack(Y) if Y else np.zeros((0, H), np.float32)
+    logger.info("Built Y np stack")
+    D_Out = np.array(D, dtype="datetime64[ns]")
+    logger.info("Built D np stack")
+    logger.info(f"Built sequences: X={X_Out.shape} Y={Y_Out.shape}")
+    return X_Out, M_Out, A_Out, Y_Out, D_Out
 
 
 def time_split_idx(n: int, val_ratio: float = 0.2):
