@@ -22,6 +22,7 @@ Run (example):
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 import asyncio
+import multiprocessing as mp
 
 import argparse
 import copy
@@ -636,32 +637,42 @@ def process_all_symbols_parallel(
     logger.info(f"Processing {prices[SYMBOL_COL].nunique()} symbols in parallel")
 
     rows: List[pd.DataFrame] = []
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        fut_to_sym: Dict[object, str] = {}
-        # submit at most ``max_workers`` tasks at a time to limit memory use
+    try:
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+            fut_to_sym: Dict[object, str] = {}
+            # submit at most ``max_workers`` tasks at a time to limit memory use
+            for sym, grp in prices.groupby(SYMBOL_COL, sort=False):
+                try:
+                    fut = ex.submit(_process_one_symbol_star, (sym, grp.copy(), cal))
+                except Exception as e:
+                    logger.exception(f"[main] failed to submit symbol={sym}: {e}")
+                    continue
+                fut_to_sym[fut] = sym
+                if len(fut_to_sym) >= max_workers:
+                    done, _ = wait(fut_to_sym.keys(), return_when=FIRST_COMPLETED)
+                    for d in done:
+                        sym_d = fut_to_sym.pop(d)
+                        try:
+                            rows.append(d.result())
+                        except Exception as e:
+                            logger.exception(f"[main] symbol={sym_d} failed: {e}")
+
+            # drain any remaining futures
+            for fut in as_completed(fut_to_sym):
+                sym = fut_to_sym[fut]
+                try:
+                    rows.append(fut.result())
+                except Exception as e:
+                    logger.exception(f"[main] symbol={sym} failed: {e}")
+    except Exception as e:
+        logger.exception(f"Parallel processing failed; falling back to sequential: {e}")
+        rows = []
         for sym, grp in prices.groupby(SYMBOL_COL, sort=False):
             try:
-                fut = ex.submit(_process_one_symbol_star, (sym, grp.copy(), cal))
-            except Exception as e:
-                logger.exception(f"[main] failed to submit symbol={sym}: {e}")
-                continue
-            fut_to_sym[fut] = sym
-            if len(fut_to_sym) >= max_workers:
-                done, _ = wait(fut_to_sym.keys(), return_when=FIRST_COMPLETED)
-                for d in done:
-                    sym_d = fut_to_sym.pop(d)
-                    try:
-                        rows.append(d.result())
-                    except Exception as e:
-                        logger.exception(f"[main] symbol={sym_d} failed: {e}")
-
-        # drain any remaining futures
-        for fut in as_completed(fut_to_sym):
-            sym = fut_to_sym[fut]
-            try:
-                rows.append(fut.result())
-            except Exception as e:
-                logger.exception(f"[main] symbol={sym} failed: {e}")
+                rows.append(_process_one_symbol(sym, grp.copy(), cal))
+            except Exception as e2:
+                logger.exception(f"[main] symbol={sym} failed: {e2}")
 
     if not rows:
         logger.info("No rows returned from parallel processing")
