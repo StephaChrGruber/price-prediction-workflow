@@ -19,8 +19,7 @@ Run (example):
 
 """
 
-from asyncio import as_completed
-from concurrent.futures import ProcessPoolExecutor, wait
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 import asyncio
 
@@ -598,28 +597,41 @@ def _process_one_symbol(sym: str,
         return pd.DataFrame(columns=[SYMBOL_COL, TIME_COL])  # empty
 
 # --- orchestrate in parallel ---------------------
+def _process_one_symbol_star(args: Tuple[str, pd.DataFrame, pd.DatetimeIndex]) -> pd.DataFrame:
+    """Helper to unpack args for ``ProcessPoolExecutor.map``."""
+    return _process_one_symbol(*args)
+
+
 def process_all_symbols_parallel(prices: pd.DataFrame,
                                  cal: pd.DatetimeIndex,
                                  max_workers: int | None = None) -> pd.DataFrame:
+    """Parallelize per-symbol processing with a process pool.
+
+    This implementation streams tasks to the worker pool instead of materialising
+    all symbol dataframes in memory at once.  The previous approach built a full
+    list of ``(symbol, dataframe)`` pairs and spawned a nested process pool which
+    doubled the number of workers and significantly increased peak RAM usage.
     """
-    Parallelize the per-symbol processing with a process pool.
-    """
+
     max_workers = max_workers or max(1, (os.cpu_count() or 2) - 1)
     logger.info(f"Processing {prices[SYMBOL_COL].nunique()} symbols in parallel")
 
-    # Build tasks: one (sym, df) per symbol
-    tasks = [(sym, grp.copy()) for sym, grp in prices.groupby(SYMBOL_COL, sort=False)]
+    # Stream each symbol's dataframe to the executor to avoid duplicating them in
+    # memory.  ``chunksize=1`` ensures at most ``max_workers`` frames are held at
+    # once.
+    def task_iter():
+        for sym, grp in prices.groupby(SYMBOL_COL, sort=False):
+            yield sym, grp.copy(), cal
 
-    rows = []
+    rows: List[pd.DataFrame] = []
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        with ProcessPoolExecutor(max_workers=8) as ex:
-            futures = [ex.submit(_process_one_symbol, sym, g, cal) for sym, g in tasks]
-            wait(futures)  # <-- blocks until all complete
-            rows = [f.result() for f in futures]  # collect (raises errors if any)
+        for res in ex.map(_process_one_symbol_star, task_iter(), chunksize=1):
+            rows.append(res)
 
     if not rows:
         logger.info("No rows returned from parallel processing")
         return pd.DataFrame()
+
     out = pd.concat(rows, ignore_index=True)
     logger.info(f"Parallel processing complete: rows={len(out)}")
     return out
