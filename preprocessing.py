@@ -268,8 +268,7 @@ def merge_weather(panel: pd.DataFrame, weather_daily: pd.DataFrame, n_components
     wxz = transform_weather_pca(weather_daily, pca, sc, wx_cols, names)
     wxz_pd = wxz.to_pandas() if hasattr(wxz, "to_pandas") else wxz
     out = panel.merge(wxz_pd, on=TIME_COL, how="left")
-    out = pl.from_pandas(out)
     for n in names:
-        out = out.with_columns(pl.col(n).fill_null(0.0))
+        out[n] = out[n].fillna(0.0)
     logger.info(f"Merged weather data: shape={out.shape}")
-    return out.to_pandas(), pca, sc, names
+    return out, pca, sc, names

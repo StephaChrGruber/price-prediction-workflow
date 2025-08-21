@@ -130,7 +130,9 @@ def build_sequences_multi(panel: pd.DataFrame, lookback: int, features: List[str
     panel = panel.sort_values([SYMBOL_COL, TIME_COL])
     X, M, A, Y, D = [], [], [], [], []
     H = len(target_cols)
+
     for sym, g in panel.groupby(SYMBOL_COL):
+        logger.info(f"Building sequence for [{sym}]")
         g = g.reset_index(drop=True)
         for t in range(lookback, len(g)):
             y = g.loc[t, target_cols].values.astype(np.float32)
