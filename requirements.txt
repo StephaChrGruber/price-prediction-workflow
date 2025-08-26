@@ -12,3 +12,5 @@ python-snappy
 tensor
 torch
 joblib
+psutil
+duckdb

@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 import gc
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -40,7 +40,6 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import IncrementalPCA
 
 import torch
 import torch.nn as nn
@@ -58,20 +57,17 @@ from data_utils import (
     table_from_df_and_schema,
     stream_parquet_process,
 )
-from diagnostics import setup_diagnostics, log_mem, set_seed, safe_log
+from old.diagnostics import setup_diagnostics, log_mem, set_seed, safe_log
 from preprocessing import (
-    to_dt,
     prep_stocks,
     prep_crypto,
     prep_fx,
     prep_news_global,
     prep_weather_daily,
     merge_weather,
-    fit_weather_pca,
-    transform_weather_pca,
 )
-from constants import TIME_COL, SYMBOL_COL, EPS
-from memory_utils import reduce_mem_usage
+from old.constants import TIME_COL, SYMBOL_COL, EPS
+from old.memory_utils import reduce_mem_usage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -703,7 +699,7 @@ def parse_args():
     p.add_argument("--rank-quantile", type=float, default=float(os.getenv("RANK_QUANTILE", 0.5)))
     p.add_argument("--ignore-days", type=int, default=int(os.getenv("IGNORE_DAYS", 0)))
     # Artifacts
-    p.add_argument("--artifacts-dir", type=str, default=os.getenv("ARTIFACTS_DIR", "outputs"))
+    p.add_argument("--artifacts-dir", type=str, default=os.getenv("ARTIFACTS_DIR", "../outputs"))
     return p.parse_args()
 
 
@@ -1142,23 +1138,23 @@ async def main(args):
         ])
 
     await asyncio.gather(stage_collection_with_schema(
-                                out_path="data/DailyStockData.parquet",
+                                out_path="../data/DailyStockData.parquet",
                                 iter_chunks_fn=iter_stocks_chunks,
                                 canonical_schema=stock_schema(32),  # used only if file doesn't exist yet
                                 resume=True,
                                 compression="zstd"),
-        stage_collection_with_schema(out_path="data/DailyCryptoData.parquet",
+        stage_collection_with_schema(out_path="../data/DailyCryptoData.parquet",
                                      iter_chunks_fn=iter_crypto_chunks,
                                      canonical_schema=crypto_schema(32),  # used only if file doesn't exist yet
                                      resume=True,
                                      compression="zstd"),
-        stage_collection_with_schema(out_path="data/DailyWeatherData.parquet",
+        stage_collection_with_schema(out_path="../data/DailyWeatherData.parquet",
                                      iter_chunks_fn=iter_weather_chunks,
                                      canonical_schema=weather_schema(32),  # used only if file doesn't exist yet
                                      resume=True,
                                      compression="zstd"),
         stage_news(),
-        stage_collection_with_schema(out_path="data/DailyCurrencyExchangeRates.parquet",
+        stage_collection_with_schema(out_path="../data/DailyCurrencyExchangeRates.parquet",
                                      iter_chunks_fn=iter_fx_chunks,
                                      canonical_schema=fx_schema(32),  # used only if file doesn't exist yet
                                      resume=True,

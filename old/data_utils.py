@@ -123,7 +123,7 @@ def align_df_to_schema(df: pl.DataFrame, schema: pa.Schema) -> pl.DataFrame:
         if pl_type == pl.Datetime:
             out = out.with_columns(pl.col(name).dt.replace_time_zone(None))
         elif pl_type in (pl.Float32, pl.Float64):
-            out = out.with_columns(pl.col(name).cast(pl_type, strict=False))
+            out = out.with_columns(pl.col(name).cast(pl_type, strict=False).fill_null(0.0))
         elif pl_type in (pl.Int32, pl.Int64):
             out = out.with_columns(pl.col(name).cast(pl_type, strict=False).fill_null(0))
         elif pl_type == pl.Utf8:

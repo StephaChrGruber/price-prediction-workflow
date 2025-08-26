@@ -4,12 +4,10 @@ from datetime import datetime
 
 import numpy as np
 import polars as pl
-from tqdm import tqdm
 from sklearn.decomposition import IncrementalPCA
 from sklearn.preprocessing import StandardScaler
 
-from constants import TIME_COL, SYMBOL_COL, EPS
-from diagnostics import safe_log
+from old.constants import TIME_COL, SYMBOL_COL, EPS
 import pandas as pd
 
 logger = logging.getLogger(__name__)
