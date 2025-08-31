@@ -25,19 +25,19 @@ def parse_args() -> Namespace:
     p.add_argument("--weather-agg", type=str, choices=["mean","median"], default=os.getenv("WEATHER_AGG", "mean"))
     p.add_argument("--fold-aware-weather-pca", action="store_true", default=os.getenv("FOLD_AWARE_WEATHER_PCA", "false").lower()=="true")
     # Model/training
-    p.add_argument("--lookback", type=int, default=int(os.getenv("LOOKBACK", 180)))
-    p.add_argument("--batch", type=int, default=int(os.getenv("BATCH", 256)))
+    p.add_argument("--lookback", type=int, default=int(os.getenv("LOOKBACK", 90)))
+    p.add_argument("--batch", type=int, default=int(os.getenv("BATCH", 128)))
     p.add_argument("--epochs", type=int, default=int(os.getenv("EPOCHS", 15)))
     p.add_argument("--lr", type=float, default=float(os.getenv("LR", 7e-4)))
     p.add_argument("--dropout", type=float, default=float(os.getenv("DROPOUT", 0.15)))
     p.add_argument("--layers", type=int, default=int(os.getenv("LAYERS", 2)))
-    p.add_argument("--hidden", type=int, default=int(os.getenv("HIDDEN", 128)))
+    p.add_argument("--hidden", type=int, default=int(os.getenv("HIDDEN", 256)))
     p.add_argument("--weight-decay", type=float, default=float(os.getenv("WEIGHT_DECAY", 1e-4)))
     p.add_argument("--seed", type=int, default=int(os.getenv("SEED", 42)))
-    p.add_argument("--num-workers", type=int, default=int(os.getenv("NUM_WORKERS", 2)))
+    p.add_argument("--num-workers", type=int, default=int(os.getenv("NUM_WORKERS", 1)))
     # Split strategy
     p.add_argument("--walk-forward", action="store_true", default=os.getenv("WALK_FORWARD", "false").lower()=="true")
-    p.add_argument("--train-span-days", type=int, default=int(os.getenv("TRAIN_SPAN_DAYS", 365*3)))
+    p.add_argument("--train-span-days", type=int, default=int(os.getenv("TRAIN_SPAN_DAYS", 182)))
     p.add_argument("--val-span-days", type=int, default=int(os.getenv("VAL_SPAN_DAYS", 90)))
     p.add_argument("--step-days", type=int, default=int(os.getenv("STEP_DAYS", 90)))
     p.add_argument("--val-ratio", type=float, default=float(os.getenv("VAL_RATIO", 0.2)))
@@ -47,7 +47,7 @@ def parse_args() -> Namespace:
     # News PCA cap
     p.add_argument("--news-pca-cap", type=int, default=int(os.getenv("NEWS_PCA_CAP", 32)))
     # Output / ranking
-    p.add_argument("--top-k", type=int, default=int(os.getenv("TOP_K", 20)))
+    p.add_argument("--top-k", type=int, default=int(os.getenv("TOP_K", 25)))
     p.add_argument("--rank-horizon", type=str, default=os.getenv("RANK_HORIZON", "1y"))
     p.add_argument("--rank-quantile", type=float, default=float(os.getenv("RANK_QUANTILE", 0.5)))
     p.add_argument("--ignore-days", type=int, default=int(os.getenv("IGNORE_DAYS", 0)))

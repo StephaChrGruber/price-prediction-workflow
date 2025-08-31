@@ -19,7 +19,7 @@ from torch.utils.data import IterableDataset
 
 from util.constants import SYMBOL_COL, TIME_COL, EPS
 from util.data_utils import mongo_client
-from util.diagnostics import setup_diagnostics, disable_diagnostics, set_seed
+from util.diagnostics import setup_diagnostics, disable_diagnostics, set_seed, __log
 import torch.nn as nn
 
 logging.basicConfig(
@@ -260,37 +260,74 @@ def _first_batch_nan_guard(x, y):
     if torch.isnan(y).any() or torch.isinf(y).any():
         __log.info("[FATAL] Non-finite in Y batch"); idx = torch.where(~torch.isfinite(y)); __log.info(f"indices: {[t[:5].tolist() for t in idx]}"); raise SystemExit(1)
 
-def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=15):
+_last_tl = None
+_last_vl = None
+
+def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=2):
     __log.info("Starting point training")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = nn.SmoothL1Loss(); best=float('inf'); best_state=copy.deepcopy(model.state_dict()); bad=0
+    loss_fn = nn.SmoothL1Loss()
+    best = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+    bad = 0
     model.to(device)
-    for ep in range(1, epochs+1):
-        model.train(); tl=0.0; first=True
-        for x,m,a,y in tqdm(tr_dl, desc=f"Ep {ep}/{epochs}"):
-            x,m,a,y = x.to(device), m.to(device), a.to(device), y.to(device)
-            if first: _first_batch_nan_guard(x,y); first=False
-            opt.zero_grad(); pred = model(x,a,m); loss = loss_fn(pred,y)
-            if torch.isnan(loss) or torch.isinf(loss): __log.info("[FATAL] loss non-finite"); raise SystemExit(1)
-            loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 2.0); opt.step()
-            tl += loss.item()*len(y)
-        tl /= len(tr_dl.dataset) if len(tr_dl.dataset) else float('nan')
-        model.eval(); vl=0.0
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        tl_sum = 0.0
+        tl_den = 0
+        first = True
+
+        for x, m, a, y in tqdm(tr_dl, desc=f"Ep {ep}/{epochs}"):
+            x, m, a, y = x.to(device), m.to(device), a.to(device), y.to(device)
+            if first:
+                _first_batch_nan_guard(x, y)
+                first = False
+
+            opt.zero_grad()
+            pred = model(x, a, m)
+            loss = loss_fn(pred, y)
+            if torch.isnan(loss) or torch.isinf(loss):
+                __log.info("[FATAL] loss non-finite"); raise SystemExit(1)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+            opt.step()
+
+            bsz = y.size(0)
+            tl_sum += loss.item() * bsz
+            tl_den += bsz
+
+        tl = tl_sum / tl_den if tl_den else float("nan")
+
+        # ---- validation ----
+        model.eval()
+        vl_sum = 0.0
+        val_seen = 0
+
         with torch.no_grad():
-            for x,m,a,y in va_dl:
-                x,m,a,y = x.to(device), m.to(device), a.to(device), y.to(device)
-                vloss = nn.functional.smooth_l1_loss(model(x,a,m), y)
-                vl += vloss.item()*len(y)
-        vl /= len(va_dl.dataset) if len(va_dl.dataset) else float('nan')
+            for x, m, a, y in va_dl:
+                vloss = nn.functional.smooth_l1_loss(model(x, a, m), y)
+                vl_sum += vloss.item() * y.size(0)
+                val_seen += y.size(0)
+
+        vl = vl_sum / val_seen if val_seen > 0 else float("inf")
+        if val_seen == 0:
+            __log.warning("Validation set is empty, setting val=inf")
+
         __log.info(f"Train {tl:.5f} | Val {vl:.5f}")
-        if vl < best - 1e-4: best, best_state, bad = vl, copy.deepcopy(model.state_dict()), 0
+
+        if vl < best - 1e-4:
+            best, best_state, bad = vl, copy.deepcopy(model.state_dict()), 0
         else:
             bad += 1
-            if bad > patience: __log.info("Early stop")
-            break
+            if bad > patience:
+                __log.info("Early stop")
+                break
+
     model.load_state_dict(best_state)
     __log.info("Finished point training")
     return model, best
+
 
 def persist_topk_to_mongo(pred_df: pd.DataFrame, top_k = 25):
     __log.info(pred_df.head(top_k))
@@ -324,18 +361,24 @@ def score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device):
     __log.info(f"Point predictions generated: rows={len(df)}")
     return df
 
-def walk_forward_ranges(min_date, max_date, train_span_days=365*3, val_span_days=90, step_days=90):
+HORIZON_DAYS = [7, 30, 182, 365]
+HMAX = max(HORIZON_DAYS)
+
+def walk_forward_ranges(min_date, max_date, train_span_days, val_span_days, step_days):
     start = pd.to_datetime(min_date)
-    end   = pd.to_datetime(max_date)
+    maxd  = pd.to_datetime(max_date)
+    usable_end = maxd - pd.Timedelta(days=HMAX)   # <<< important
+
     train_span = pd.Timedelta(days=train_span_days)
     val_span   = pd.Timedelta(days=val_span_days)
     step       = pd.Timedelta(days=step_days)
+
     anchor = start + train_span
     i = 0
     while True:
         tr_start, tr_end = anchor - train_span, anchor
         va_start, va_end = anchor, anchor + val_span
-        if tr_end > end or va_end > end:
+        if tr_end > usable_end or va_end > usable_end:   # <<< clamp
             break
         yield i, (tr_start, tr_end), (va_start, va_end)
         i += 1
@@ -379,59 +422,77 @@ def reduce_daily_duplicates(g: pd.DataFrame) -> pd.DataFrame:
         g = g[cols].groupby(TIME_COL, as_index=False).agg({c: rules[c] for c in cols if c != TIME_COL})
     return g
 
-def build_sequences_one_symbol(df, lookback, features, tcols, mcols):
-    # df is already one symbol, sorted by date, deduped; create features used by your panel code
-    g = df.set_index(TIME_COL)
+def build_sequences_one_symbol(df, lookback, features, horizons_days, label_start, label_end):
+    g = df.sort_values(TIME_COL).copy()
+    ts = pd.to_datetime(g[TIME_COL]).to_numpy()
 
-    # mark trading days and fill prices
-    for col in ["close","open","high","low"]:
-        g[col] = pd.to_numeric(g.get(col, np.nan), errors="coerce").ffill().bfill().fillna(0.0).clip(lower=EPS)
-    # technicals
-    logc = safe_log(g["close"].to_numpy())
-    g["logret_1d"] = np.diff(logc, prepend=logc[0])
-    g["vol_20d"]   = pd.Series(g["logret_1d"], index=g.index).rolling(20, min_periods=1).std().fillna(0.0).to_numpy()
-    g["mom_63d"]   = pd.Series(logc, index=g.index).diff(63).fillna(0.0).to_numpy()
-    g["hl_spread"] = ((g["high"] - g["low"]) / np.maximum(g["close"], EPS)).astype(float)
-
-    # ensure all requested feature cols exist
+    # ensure features exist & are finite
     for c in features:
         if c not in g.columns:
             g[c] = 0.0
+    g[features] = (g[features].replace([np.inf, -np.inf], np.nan)
+                                .ffill().bfill().fillna(0.0)).astype(np.float32)
 
-    g[features] = (
-        g[features]
-        .replace([np.inf, -np.inf], np.nan)
-        .ffill()
-        .bfill()
-        .fillna(0.0)
-    ).astype(np.float32)
+    close = pd.to_numeric(g["close"], errors="coerce").to_numpy(np.float64)
+    close = np.where((close > 0) & np.isfinite(close), close, np.nan)
+    logc  = np.log(close)
 
-    g = g.reset_index()  # bring date back as column
+    hmax = max(horizons_days) if horizons_days else 0
+    L = len(g)
+    if L < lookback + hmax + 1:
+        return None
+
+    sym_first = ts[0]
+    sym_last = ts[-1]
+    eff_start = max(pd.to_datetime(label_start), sym_first + pd.Timedelta(days=lookback - 1))
+    eff_end = min(pd.to_datetime(label_end), sym_last - pd.Timedelta(days=hmax))
+    if eff_end < eff_start:
+        return None
+
+    t_lo = lookback
+    t_hi = L - 1 - hmax
+    lbl_mask = (ts >= eff_start) & (ts <= eff_end)
+
     Xs, Ms, Ys = [], [], []
-    for t in range(lookback, len(g)):
-        win = g.iloc[t - lookback: t]
-        mask = win["is_trading_day"].to_numpy(dtype=bool)
+    for t in range(t_lo, t_hi + 1):
+        if not lbl_mask[t]:  # label time outside feasible window
+            continue
 
-        Xs.append(win[features].to_numpy(dtype=np.float32))
-        Ms.append(mask.astype(np.float32))
-        # multi-horizon targets: use prebuilt tcols/mcols if you have them, else example 1y log return
+        win = g.iloc[t - lookback: t]
+        x = win[features].to_numpy(np.float32, copy=True)
+        if not np.isfinite(x).all():
+            continue
+
+        m = np.ones(lookback, dtype=bool)
+
+        a = logc[t]
+        if not np.isfinite(a):
+            continue
+
         y = []
-        for col in tcols:
-            if col in g.columns:
-                y.append(g.loc[t, col])
-            else:
-                # fallback: 1y=252 logret if not present (guard window)
-                y.append(np.nan)
-        Ys.append(np.array(y, dtype=np.float32))
+        ok = True
+        for H in horizons_days:
+            b = logc[t + H]
+            if not np.isfinite(b):
+                ok = False
+                break
+            y.append(np.float32(b - a))
+        if not ok:
+            continue
+
+        Xs.append(x)
+        Ms.append(m)
+        Ys.append(np.asarray(y, dtype=np.float32))
+
     if not Xs:
         return None
-    X = np.stack(Xs)      # [N, T, F]
-    M = np.stack(Ms)      # [N, T]
-    Y = np.stack(Ys)      # [N, H]
-    return X, M, Y
+    return np.stack(Xs), np.stack(Ms), np.stack(Ys)
+
+
 
 class PanelStreamDataset(IterableDataset):
-    def __init__(self, symbols, start, end, lookback, features, tcols, mcols, asset2id):
+
+    def __init__(self, symbols, start, end, lookback, features, tcols, mcols, asset2id, horizon_days = [7, 30, 182, 365]):
         super().__init__()
         self.symbols = list(symbols)
         self.start = pd.to_datetime(start)
@@ -442,6 +503,7 @@ class PanelStreamDataset(IterableDataset):
         self.tcols = tcols
         self.mcols = mcols
         self.asset2id = asset2id
+        self.horizon_days = horizon_days
 
     def __iter__(self):
         con = _get_duck()  # per-worker duckdb connection (as in earlier fix)
@@ -451,13 +513,25 @@ class PanelStreamDataset(IterableDataset):
                   ORDER BY date
                 """
         for sym in self.symbols:
-            df = con.execute(q, [sym, (self.start - self.lbpad).date(), self.end.date()]).df()
+            fpad = pd.Timedelta(days=HMAX)
+            df = con.execute(q, [sym,
+                                 (self.start - self.lbpad),
+                                 (self.end + fpad)  # <<< pad for labels
+                                 ]).df()
+
+            #info = _diagnose_symbol(df, sym, self.lookback, self.horizon_days, self.start, self.end)
+            #logging.getLogger(__name__).info("[val diag] " + info)
+
             if df.empty:
                 continue
             df[TIME_COL] = pd.to_datetime(df[TIME_COL]).dt.normalize()
-            df = reduce_daily_duplicates(df)
 
-            seqs = build_sequences_one_symbol(df, self.lookback, self.features, self.tcols, self.mcols)
+            seqs = build_sequences_one_symbol(df,
+                                  lookback=self.lookback,
+                                  features=self.features,
+                                  horizons_days=self.horizon_days,
+                                  label_start=self.start,
+                                  label_end=self.end)
             if seqs is None:
                 continue
             X, M, Y = seqs
@@ -533,6 +607,19 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
 
     return sorted(heap, key=lambda t: t[0], reverse=True)
 
+def _diagnose_symbol(df, sym, lookback, horizons_days, label_start, label_end):
+    ts = pd.to_datetime(df[TIME_COL]).sort_values().to_numpy()
+    if ts.size == 0:
+        return f"{sym}: no rows"
+    hmax = max(horizons_days)
+    sym_first, sym_last = ts[0], ts[-1]
+    eff_start = max(pd.to_datetime(label_start), sym_first + pd.Timedelta(days=lookback-1))
+    eff_end   = min(pd.to_datetime(label_end),   sym_last  - pd.Timedelta(days=hmax))
+
+    return (f"{sym}: rows={len(ts)} "
+            f"sym_range=[{str(sym_first)},{str(sym_last)}], "
+            f"eff_lbl=[{str(eff_start.date())},{str(eff_end.date())}]")
+
 
 # B) Second pass: training with scaling applied on the fly
 class ScaledWrapper(IterableDataset):
@@ -563,8 +650,7 @@ def train():
     q_panel = f"""
             SELECT *
             FROM read_parquet('data/PriceData.prepped.parquet')
-            ORDER BY symbol, date
-            LIMIT 1
+            ORDER BY symbol, date ASC
             """
 
     q_file = "read_parquet('data/PriceData.prepped.parquet')"
@@ -587,6 +673,8 @@ def train():
         tr_start, tr_end = tr_rng
         va_start, va_end = va_rng
         __log.info(f"[fold {fold}] train {tr_start.date()}→{tr_end.date()}  val {va_start.date()}→{va_end.date()}")
+        #__log.info(
+        #    f"[fold {fold}] train {tr_start.date()}→{tr_end.date()}  val {va_start.date()}→{va_end.date()}  (usable_end={(pd.to_datetime(max_date) - pd.Timedelta(days=max(HORIZON_DAYS))).date()})")
 
         # make sure this line always runs inside the fold, before the loop
         scaler = OnlineStandardizer(n_features=len(features))
@@ -595,7 +683,7 @@ def train():
         ds_tr_pass1 = PanelStreamDataset(symbols, tr_start, tr_end, args.lookback,
                                          features, tcols, mcols, asset2id)
 
-        for X, M, Y, A in DataLoader(ds_tr_pass1, batch_size=1, num_workers=0, collate_fn=collate_batch):
+        for X, M, A, Y in DataLoader(ds_tr_pass1, batch_size=1, num_workers=0, collate_fn=collate_batch):
             scaler.partial_fit(X.numpy())
             seen = True
 
@@ -618,13 +706,34 @@ def train():
                            collate_fn=collate_batch, pin_memory=True, persistent_workers=True)
 
         # C) Build model & train as before (input_dim = len(features), horizons = H)
-        model = PriceForecastMulti(len(features), n_assets=len(symbols), out_dim=len(features),
-                                   hidden=args.hidden, layers=args.layers, dropout=args.dropout)
+        H = len(cal)  # e.g., 4 for [7,30,182,365]
+        model = PriceForecastMulti(
+            n_features=len(features),
+            n_assets=len(symbols),  # ensure this is a list, not a DataFrame
+            out_dim=H,  # ✅ match Y’s second dim
+            hidden=args.hidden,
+            layers=args.layers,
+            dropout=args.dropout
+        )
+        n_val = 0
+        for batch in dl_va:
+            n_val += 1
+        __log.info(f"val batches: {n_val}")
+
+        probe = PanelStreamDataset(symbols, va_start, va_end, args.lookback,
+                                   features, tcols, mcols, asset2id,
+                                   horizon_days=HORIZON_DAYS)
+        val_count = sum(1 for _ in DataLoader(probe, batch_size=1, num_workers=0))
+        __log.info(f"[debug] val candidate sequences (batch=1): {val_count}")
+
         model, best = train_point(model, dl_tr, dl_va, device, args.epochs, args.lr, args.weight_decay)
         __log.info(f"[fold {fold}] best val: {best:.6f}")
 
         del dl_tr, dl_va
         gc.collect()
+
+    if scaler is None:
+        return
 
     trained_mean, trained_std = scaler.finalize()
 
