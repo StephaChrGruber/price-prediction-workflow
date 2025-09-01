@@ -21,6 +21,7 @@ from util.constants import SYMBOL_COL, TIME_COL, EPS
 from util.data_utils import mongo_client
 from util.diagnostics import setup_diagnostics, disable_diagnostics, set_seed, __log
 import torch.nn as nn
+from util.multimodal_model import PriceEncoder, FXEncoder, MultiModalPriceForecast
 
 logging.basicConfig(
     level=logging.INFO,
@@ -254,6 +255,30 @@ class AttentionPool(nn.Module):
         pooled = (x * w.unsqueeze(-1)).sum(dim=1)   # [B, D]
         return pooled, w
 
+
+class ZeroWeatherEncoder(nn.Module):
+    """Placeholder encoder returning zeros for weather modality."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        return torch.zeros(x.size(0), self.d_model, device=x.device)
+
+
+class ZeroNewsEncoder(nn.Module):
+    """Placeholder encoder returning zeros for news modality."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+    def forward(self, tokens: dict, mask: torch.Tensor | None = None) -> torch.Tensor:
+        device = tokens["input_ids"].device
+        B = tokens["input_ids"].size(0)
+        return torch.zeros(B, self.d_model, device=device)
+
 def _first_batch_nan_guard(x, y):
     if torch.isnan(x).any() or torch.isinf(x).any():
         __log.info("[FATAL] Non-finite in X batch"); idx = torch.where(~torch.isfinite(x)); __log.info(f"indices: {[t[:5].tolist() for t in idx]}"); raise SystemExit(1)
@@ -263,7 +288,8 @@ def _first_batch_nan_guard(x, y):
 _last_tl = None
 _last_vl = None
 
-def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=2):
+def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_decay=1e-4, patience=2,
+                price_idx=None, fx_idx=None):
     __log.info("Starting point training")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.SmoothL1Loss()
@@ -280,12 +306,19 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
 
         for x, m, a, y in tqdm(tr_dl, desc=f"Ep {ep}/{epochs}"):
             x, m, a, y = x.to(device), m.to(device), a.to(device), y.to(device)
+            price_x = x[:, :, price_idx]
+            fx_x = x[:, :, fx_idx]
+            weather_x = torch.zeros(price_x.size(0), price_x.size(1), 1, device=device)
+            news_tokens = {
+                "input_ids": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
+                "attention_mask": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
+            }
             if first:
                 _first_batch_nan_guard(x, y)
                 first = False
 
             opt.zero_grad()
-            pred = model(x, a, m)
+            pred = model(price_x, a, m, fx_x, m, weather_x, m, news_tokens, m)
             loss = loss_fn(pred, y)
             if torch.isnan(loss) or torch.isinf(loss):
                 __log.info("[FATAL] loss non-finite"); raise SystemExit(1)
@@ -306,7 +339,17 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
 
         with torch.no_grad():
             for x, m, a, y in va_dl:
-                vloss = nn.functional.smooth_l1_loss(model(x, a, m), y)
+                x, m, a, y = x.to(device), m.to(device), a.to(device), y.to(device)
+                price_x = x[:, :, price_idx]
+                fx_x = x[:, :, fx_idx]
+                weather_x = torch.zeros(price_x.size(0), price_x.size(1), 1, device=device)
+                news_tokens = {
+                    "input_ids": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
+                    "attention_mask": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
+                }
+                vloss = nn.functional.smooth_l1_loss(
+                    model(price_x, a, m, fx_x, m, weather_x, m, news_tokens, m), y
+                )
                 vl_sum += vloss.item() * y.size(0)
                 val_seen += y.size(0)
 
@@ -539,6 +582,7 @@ class PanelStreamDataset(IterableDataset):
             A = torch.tensor(aid, dtype=torch.long)  # constant per symbol
             for i in range(len(X)):
                 yield (
+                    sym,
                     torch.from_numpy(X[i]),  # [T, F]
                     torch.from_numpy(M[i]).bool(),  # [T]
                     A,  # scalar LongTensor
@@ -546,7 +590,10 @@ class PanelStreamDataset(IterableDataset):
                 )
 
 def collate_batch(samples):
-    X, M, A, Y = zip(*samples)
+    if len(samples[0]) == 5:
+        _, X, M, A, Y = zip(*samples)
+    else:
+        X, M, A, Y = zip(*samples)
     return (torch.stack(X),                # [B, T, F]
             torch.stack(M),                # [B, T]
             torch.stack(A),                # [B]
@@ -554,20 +601,18 @@ def collate_batch(samples):
 
 def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                     lookback, features, tcols, mcols, mean, std,
-                    top_k=25, rank_horizon_idx=-1, asset2id=None):
+                    price_idx, fx_idx, top_k=25, rank_horizon_idx=-1, asset2id=None):
     """
     Returns a list of (rank_value, symbol, extra) for the top_k symbols.
     rank_horizon_idx: which horizon to rank by (e.g., -1 = last horizon like 1y)
     """
-    import heapq, torch
-    from torch.utils.data import DataLoader
+    import heapq
 
     model.eval()
     heap = []
-    mean_t = torch.from_numpy(mean).to(device)
-    std_t  = torch.from_numpy(std).to(device)
+    mean_t = torch.from_numpy(mean)
+    std_t  = torch.from_numpy(std)
 
-    # Stream sequences ending at `as_of_end`
     ds = PanelStreamDataset(
         symbols=symbols,
         start=as_of_end - pd.Timedelta(days=lookback+5),
@@ -576,30 +621,21 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
         asset2id=asset2id
     )
 
-    # IMPORTANT: make the dataset yield the symbol too (see note below)
-    # i.e., iterator yields (sym, X[T,F], M[T]) or (sym, X, M, Y) — Y not needed for scoring
-
     with torch.no_grad():
-        for batch in DataLoader(ds, batch_size=1, collate_fn=lambda x: x[0]):
-            # unpack based on what your dataset yields
-            if asset2id is None:
-                sym, X, M = batch
-                A = None
-            else:
-                sym, X, M = batch
-                A = torch.tensor([asset2id.get(sym, 0)], dtype=torch.long)
-
-            X = ((X - mean_t) / std_t).unsqueeze(0)   # [1, T, F]
-            M = M.unsqueeze(0)                        # [1, T]
-
-            if A is None:
-                pred = model(X.to(device), M.to(device))           # -> [1, H]
-            else:
-                pred = model(X.to(device), M.to(device), A.to(device))  # -> [1, H]
-
+        for sym, X, M, A, _ in ds:
+            X = ((X - mean_t) / std_t).unsqueeze(0).to(device)  # [1, T, F]
+            M = M.unsqueeze(0).to(device)                       # [1, T]
+            A = A.unsqueeze(0).to(device)
+            price_x = X[:, :, price_idx]
+            fx_x = X[:, :, fx_idx]
+            weather_x = torch.zeros(price_x.size(0), price_x.size(1), 1, device=device)
+            news_tokens = {
+                "input_ids": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
+                "attention_mask": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
+            }
+            pred = model(price_x, A, M, fx_x, M, weather_x, M, news_tokens, M)
             lr = float(pred[0, rank_horizon_idx].detach().cpu())
             item = {"pred_logret": lr, "as_of": str(pd.to_datetime(as_of_end).date())}
-
             if len(heap) < top_k:
                 heapq.heappush(heap, (lr, sym, item))
             else:
@@ -629,8 +665,8 @@ class ScaledWrapper(IterableDataset):
         self.std  = torch.from_numpy(std)
 
     def __iter__(self):
-        for X, M, A, Y in self.base:
-            yield ((X - self.mean) / self.std, M, A, Y)
+        for S, X, M, A, Y in self.base:
+            yield (S, (X - self.mean) / self.std, M, A, Y)
 
 def train():
     con = duckdb.connect()
@@ -662,6 +698,10 @@ def train():
     tcols, mcols = build_target_and_mask(cal)
 
     features = [c for c in panel.columns.tolist() if c not in ["symbol", "date", "source"] and not c.startswith(("target_", "mask_"))]
+    fx_features = ["eur_fx_logret"] if "eur_fx_logret" in features else []
+    price_features = [c for c in features if c not in fx_features]
+    price_idx = [features.index(c) for c in price_features]
+    fx_idx = [features.index(c) for c in fx_features]
 
     model = None
     scaler = None
@@ -705,16 +745,20 @@ def train():
                            num_workers=args.num_workers, worker_init_fn=worker_init_fn,
                            collate_fn=collate_batch, pin_memory=True, persistent_workers=True)
 
-        # C) Build model & train as before (input_dim = len(features), horizons = H)
+        # C) Build model & train using multimodal encoders
         H = len(cal)  # e.g., 4 for [7,30,182,365]
-        model = PriceForecastMulti(
-            n_features=len(features),
-            n_assets=len(symbols),  # ensure this is a list, not a DataFrame
-            out_dim=H,  # ✅ match Y’s second dim
-            hidden=args.hidden,
+        price_enc = PriceEncoder(
+            n_features=len(price_features),
+            n_assets=len(symbols),
+            d_model=args.hidden,
             layers=args.layers,
-            dropout=args.dropout
+            dropout=args.dropout,
         )
+        fx_enc = FXEncoder(n_features=len(fx_features), d_model=args.hidden)
+        weather_enc = ZeroWeatherEncoder(args.hidden)
+        news_enc = ZeroNewsEncoder(args.hidden)
+        model = MultiModalPriceForecast(price_enc, fx_enc, weather_enc, news_enc,
+                                        out_dim=H, hidden=args.hidden, dropout=args.dropout)
         n_val = 0
         for batch in dl_va:
             n_val += 1
@@ -723,10 +767,11 @@ def train():
         probe = PanelStreamDataset(symbols, va_start, va_end, args.lookback,
                                    features, tcols, mcols, asset2id,
                                    horizon_days=HORIZON_DAYS)
-        val_count = sum(1 for _ in DataLoader(probe, batch_size=1, num_workers=0))
+        val_count = sum(1 for _ in DataLoader(probe, batch_size=1, num_workers=0, collate_fn=collate_batch))
         __log.info(f"[debug] val candidate sequences (batch=1): {val_count}")
 
-        model, best = train_point(model, dl_tr, dl_va, device, args.epochs, args.lr, args.weight_decay)
+        model, best = train_point(model, dl_tr, dl_va, device, args.epochs, args.lr, args.weight_decay,
+                                  price_idx=price_idx, fx_idx=fx_idx)
         __log.info(f"[fold {fold}] best val: {best:.6f}")
 
         del dl_tr, dl_va
@@ -745,7 +790,8 @@ def train():
         model=model, device=device, con=con, q_panel=q_file,
         symbols=symbols, as_of_end=as_of_end, lookback=args.lookback,
         features=features, tcols=tcols, mcols=mcols,
-        mean=mean, std=std, top_k=25, rank_horizon_idx=rank_h_idx,
+        mean=mean, std=std, price_idx=price_idx, fx_idx=fx_idx,
+        top_k=25, rank_horizon_idx=rank_h_idx,
         asset2id=asset2id  # pass None if your model forward is (X, M) only
     )
 
