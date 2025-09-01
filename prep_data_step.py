@@ -111,6 +111,34 @@ def prep_stocks(df: pl.DataFrame) -> pl.DataFrame:
     __log.info(f"Prepared stocks: shape={out.shape}")
     return out
 
+def prep_fx(df: pl.DataFrame) -> pl.DataFrame:
+    __log.info("Preparing FX")
+    if df.is_empty():
+        return df
+
+    d = df.clone()
+    d = d.with_columns(d.get_column(TIME_COL))
+    rate_cols = [c for c in d.columns if c not in {TIME_COL, "base_currency"}]
+
+    if not rate_cols:
+        return pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": np.zeros(len(d), dtype=float)})
+
+    rates = d.select(rate_cols).with_columns([pl.col(c).cast(pl.Float32, strict=False) for c in rate_cols])
+    rates = rates.fill_null(strategy="forward").fill_null(strategy="backward").fill_null(1.0)
+    rates = rates.select([pl.col(c).clip(lower_bound=EPS) for c in rate_cols])
+
+    log_rates = np.log(rates.to_numpy())
+    dlog = np.diff(log_rates, axis=0)
+    dlog = np.vstack([np.zeros((1, dlog.shape[1]), dtype=float), dlog])
+
+    eur_fx_logret = np.nanmean(dlog, axis=1)
+    eur_fx_logret = np.where(np.isfinite(eur_fx_logret), eur_fx_logret, 0.0).astype(np.float32)
+    out = pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": eur_fx_logret})
+
+    __log.info(f"Prepared FX: shape={out.shape}")
+
+    return out
+
 def merge_parquet(first_in_path: str, second_in_path: str, out_path: str,chunk_rows: int = 100_000,compression: str = "zstd", del_in: bool = True):
     __log.info(f"Merging {first_in_path} and {second_in_path} into {out_path}")
     if os.path.exists(out_path):
@@ -320,6 +348,13 @@ def prep_data():
 
 
     pre_prices()
+
+    stream_parquet(
+        "data/DailyFxData.parquet",
+        "data/DailyFxData.prepped.parquet",
+        prep_fx,
+        chunk_rows=500
+    )
 
 
 
