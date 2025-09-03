@@ -91,10 +91,16 @@ def arrow_field_to_pl_dtype(field: pa.Field):
         return pl.Float32
     if pa.types.is_float64(t):
         return pl.Float64
+    if pa.types.is_int8(t):
+        return pl.Int8
+    if pa.types.is_int16(t):
+        return pl.Int16
     if pa.types.is_int32(t):
         return pl.Int32
     if pa.types.is_int64(t):
         return pl.Int64
+    if pa.types.is_boolean(t):
+        return pl.Boolean
     return None
 
 def align_df_to_schema(df: pl.DataFrame, schema: pa.Schema) -> pl.DataFrame:
@@ -102,9 +108,11 @@ def align_df_to_schema(df: pl.DataFrame, schema: pa.Schema) -> pl.DataFrame:
     out = df.clone()
     for field in schema:
         name = field.name
+
         if name not in out.columns:
             pl_type = arrow_field_to_pl_dtype(field)
             out = out.with_columns(pl.lit(None).cast(pl_type or pl.Null).alias(name))
+
 
         pl_type = arrow_field_to_pl_dtype(field)
         if pl_type is None:

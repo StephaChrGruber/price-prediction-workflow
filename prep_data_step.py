@@ -133,7 +133,7 @@ def prep_fx(df: pl.DataFrame) -> pl.DataFrame:
 
     eur_fx_logret = np.nanmean(dlog, axis=1)
     eur_fx_logret = np.where(np.isfinite(eur_fx_logret), eur_fx_logret, 0.0).astype(np.float32)
-    out = pl.DataFrame({TIME_COL: d[TIME_COL], "eur_fx_logret": eur_fx_logret})
+    out = pl.DataFrame({TIME_COL: d[TIME_COL], f"eur_fx_logret": eur_fx_logret})
 
     __log.info(f"Prepared FX: shape={out.shape}")
 
@@ -150,13 +150,16 @@ def merge_parquet(first_in_path: str, second_in_path: str, out_path: str,chunk_r
     first_schema: Schema = pf_first.schema_arrow
     second_schema: Schema = pf_second.schema_arrow
     schema = []
+    schema_names = []
 
     for s in first_schema:
         schema.append((s.name, s.type))
+        schema_names.append(s.name)
 
     for s in second_schema:
-        if s.name not in second_schema.names:
+        if s.name not in schema_names:
             schema.append((s.name, s.type))
+            schema_names.append(s.name)
 
     schema = pa.schema(schema)
 
@@ -320,7 +323,7 @@ def pre_prices():
         data = pl.from_pandas(prep_one_symbol(symbol, data,asset2id, cal, horizon_days=HORIZONS)).to_arrow()
 
         if writer is None:
-            writer = pq.ParquetWriter("data/PriceData.prepped.parquet", data.schema)
+            writer = pq.ParquetWriter("data/PriceData.aftersymbols.parquet", data.schema)
 
         writer.write_table(data)
 
@@ -356,6 +359,9 @@ def prep_data():
         chunk_rows=500
     )
 
+    merge_parquet("data/PriceData.aftersymbols.parquet",
+                  "data/DailyFxData.prepped.parquet",
+                  "data/PriceData.prepped.parquet")
 
 
 

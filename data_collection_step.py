@@ -39,6 +39,8 @@ def sanitize_list_column(series: pl.Series, dtype: np.dtype, fixed_len: int | No
         except Exception:
             return [0.0] * (fixed_len or 0)
 
+    return _clean(series)
+
 # ---- SCHEMA ----
 
 def crypto_schema(float_bits=32) -> pa.Schema:
@@ -204,11 +206,6 @@ def iter_news_chunks(start_id=None):
         # sanitize arrays
         df = df.with_columns(
             sanitize_list_column(df.get_column("sentiment"), np.float32, fixed_len=None)
-            .alias("sentiment")
-        )
-        df = df.with_columns(
-            sanitize_list_column(df.get_column("embeddings"), np.float32, fixed_len=512)
-            .alias("embeddings")
         )
         yield df, last_id
 
@@ -240,7 +237,7 @@ def pull_data_from_mongo():
         compression="zstd"
     )
 
-    stage_collection_with_schema(
+    """stage_collection_with_schema(
         out_path="data/DailyWeatherData.parquet",
         iter_chunks_fn=iter_weather_chunks,
         canonical_schema=weather_schema(32),
@@ -254,7 +251,7 @@ def pull_data_from_mongo():
         canonical_schema=news_schema(),
         resume=True,
         compression="zstd"
-    )
+    )"""
 
 def main():
     __log.info("Starting up data collection step")

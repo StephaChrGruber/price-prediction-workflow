@@ -5,13 +5,22 @@
 jobs:
   CloneRepo:
     resources:
-      instance-type: C7
+      instance-type: C4
     outputs:
       repo:
         type: volume
     uses: git-checkout@v1
     with:
       url: https://github.com/StephaChrGruber/price-prediction-workflow.git
+  PullData:
+    resources:
+      instance-type: C4
+    needs:
+      - CloneRepo
+    inputs:
+      repo: CloneRepo.outputs.repo
+    outputs:
+
   TrainPricePrediction:
     resources:
       instance-type: P5000

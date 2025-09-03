@@ -304,7 +304,7 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
         tl_den = 0
         first = True
 
-        for x, m, a, y in tqdm(tr_dl, desc=f"Ep {ep}/{epochs}"):
+        for x, m, a, y in tqdm(tr_dl, desc=f"Training Epoch {ep}/{epochs}"):
             x, m, a, y = x.to(device), m.to(device), a.to(device), y.to(device)
             price_x = x[:, :, price_idx]
             fx_x = x[:, :, fx_idx]
@@ -338,7 +338,7 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
         val_seen = 0
 
         with torch.no_grad():
-            for x, m, a, y in va_dl:
+            for x, m, a, y in tqdm(va_dl, f"Validating Batch"):
                 x, m, a, y = x.to(device), m.to(device), a.to(device), y.to(device)
                 price_x = x[:, :, price_idx]
                 fx_x = x[:, :, fx_idx]
@@ -760,7 +760,7 @@ def train():
         model = MultiModalPriceForecast(price_enc, fx_enc, weather_enc, news_enc,
                                         out_dim=H, hidden=args.hidden, dropout=args.dropout)
         n_val = 0
-        for batch in dl_va:
+        for _ in dl_va:
             n_val += 1
         __log.info(f"val batches: {n_val}")
 
