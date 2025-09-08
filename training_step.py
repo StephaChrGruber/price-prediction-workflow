@@ -373,14 +373,24 @@ def train_point(model, tr_dl, va_dl, device="cpu", epochs=10, lr=7e-4, weight_de
 
 
 def persist_topk_to_mongo(pred_df: pd.DataFrame, top_k = 25):
+    """Persist top predictions to MongoDB.
+
+    When no predictions are produced ``pred_df`` will be empty. Previously
+    this resulted in an "Empty DataFrame" log message which obscured the
+    underlying issue.  We now emit a clear warning and simply return early.
+    """
+
+    if pred_df.empty:
+        __log.warning("No predictions to persist; DataFrame is empty")
+        return
+
     __log.info(pred_df.head(top_k))
 
     cli = mongo_client()
-    as_of = datetime.datetime.now().replace(hour=0,minute=0,second=0,microsecond=0)
+    as_of = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     out = pred_df.head(top_k).copy()
     out["as_of"] = as_of
-    if len(out):
-        cli[args.db]["PredictedPrices"].insert_many(out.to_dict(orient="records"))
+    cli[args.db]["PredictedPrices"].insert_many(out.to_dict(orient="records"))
 
 
 def score_point(panel, FEATURES, scaler, model, HORIZONS, HLAB, device):
@@ -555,12 +565,17 @@ class PanelStreamDataset(IterableDataset):
                   WHERE symbol = ? AND date >= ? AND date <= ?
                   ORDER BY date
                 """
+        hpad = max(self.horizon_days) if self.horizon_days else 0
         for sym in self.symbols:
-            fpad = pd.Timedelta(days=HMAX)
-            df = con.execute(q, [sym,
-                                 (self.start - self.lbpad),
-                                 (self.end + fpad)  # <<< pad for labels
-                                 ]).df()
+            fpad = pd.Timedelta(days=hpad)
+            df = con.execute(
+                q,
+                [
+                    sym,
+                    (self.start - self.lbpad),
+                    (self.end + fpad),  # <<< pad for labels if horizons require it
+                ],
+            ).df()
 
             #info = _diagnose_symbol(df, sym, self.lookback, self.horizon_days, self.start, self.end)
             #logging.getLogger(__name__).info("[val diag] " + info)
@@ -615,14 +630,20 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
 
     ds = PanelStreamDataset(
         symbols=symbols,
-        start=as_of_end - pd.Timedelta(days=lookback+5),
-        end=as_of_end, lookback=lookback,
-        features=features, tcols=tcols, mcols=mcols,
-        asset2id=asset2id
+        start=as_of_end,
+        end=as_of_end,
+        lookback=lookback,
+        features=features,
+        tcols=tcols,
+        mcols=mcols,
+        asset2id=asset2id,
+        horizon_days=[],  # inference: don't require future labels
     )
 
+    produced = False
     with torch.no_grad():
         for sym, X, M, A, _ in ds:
+            produced = True
             X = ((X - mean_t) / std_t).unsqueeze(0).to(device)  # [1, T, F]
             M = M.unsqueeze(0).to(device)                       # [1, T]
             A = A.unsqueeze(0).to(device)
@@ -640,6 +661,9 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                 heapq.heappush(heap, (lr, sym, item))
             else:
                 heapq.heappushpop(heap, (lr, sym, item))
+
+    if not produced:
+        __log.warning("PanelStreamDataset produced no sequences; check input data and parameters")
 
     return sorted(heap, key=lambda t: t[0], reverse=True)
 
