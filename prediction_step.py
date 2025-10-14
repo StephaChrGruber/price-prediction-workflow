@@ -76,6 +76,20 @@ def _maybe_persist_to_mongo(df: pd.DataFrame, meta: Mapping[str, Any], top_k: in
     if docs:
         col.insert_many(docs)
 
+
+def _duckdb_connection_or_none(con: Any) -> Optional[Any]:
+    if con is None:
+        return None
+    try:
+        import duckdb  # type: ignore
+    except ModuleNotFoundError:
+        return None
+
+    if isinstance(con, duckdb.DuckDBPyConnection):
+        return con
+    return None
+
+
 def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                     lookback, features, tcols, mcols, mean, std,
                     price_idx, fx_idx, top_k=25, rank_horizon_idx=-1, asset2id=None):
@@ -90,6 +104,9 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
     mean_t = torch.from_numpy(np.array(mean))
     std_t  = torch.from_numpy(np.array(std))
 
+    duck_con = _duckdb_connection_or_none(con)
+    panel_source = q_panel or None
+
     ds = PanelStreamDataset(
         symbols=symbols,
         start=as_of_end,
@@ -101,6 +118,8 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
         asset2id=asset2id,
         horizon_days=[],  # inference should not require future label horizons
         allow_label_fallback=True,
+        duckdb_con=duck_con,
+        panel_source=panel_source,
     )
 
     produced = False

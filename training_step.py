@@ -590,6 +590,8 @@ class PanelStreamDataset(IterableDataset):
         horizon_days=[7, 30, 182, 365],
         *,
         allow_label_fallback=False,
+        duckdb_con=None,
+        panel_source=None,
     ):
         super().__init__()
         self.symbols = list(symbols)
@@ -603,11 +605,40 @@ class PanelStreamDataset(IterableDataset):
         self.asset2id = asset2id
         self.horizon_days = horizon_days
         self.allow_label_fallback = allow_label_fallback
+        self.duckdb_con = duckdb_con
+        self.panel_source = panel_source
+
+    def _panel_source_clause(self):
+        default = "read_parquet('data/PriceData.prepped.parquet')"
+        if self.panel_source is None:
+            return default
+
+        src = str(self.panel_source).strip()
+        if not src:
+            return default
+
+        lowered = src.lower()
+        if lowered.startswith("select "):
+            return f"({src})"
+        if lowered.startswith("read_parquet("):
+            return src
+
+        # Treat plain parquet paths as read_parquet calls.
+        try:
+            p = Path(src)
+        except TypeError:
+            return src
+
+        if p.suffix.lower() == ".parquet":
+            escaped = str(p).replace("'", "''")
+            return f"read_parquet('{escaped}')"
+
+        return src
 
     def __iter__(self):
-        con = _get_duck()  # per-worker duckdb connection (as in earlier fix)
-        q = """
-                  SELECT * FROM read_parquet('data/PriceData.prepped.parquet')
+        con = self.duckdb_con if self.duckdb_con is not None else _get_duck()
+        q = f"""
+                  SELECT * FROM {self._panel_source_clause()}
                   WHERE symbol = ? AND date >= ? AND date <= ?
                   ORDER BY date
                 """
