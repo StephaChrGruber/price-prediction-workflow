@@ -513,7 +513,12 @@ def build_sequences_one_symbol(
     t_lo = lookback
     t_hi = L - 1 - hmax
     if t_hi < t_lo:
-        return None
+        if horizons_days:
+            return None
+        # During inference we may not yet have ``lookback`` rows of history.
+        # Fall back to using the most recent label index that exists and rely on
+        # padding logic below to build a full window.
+        t_lo = max(0, t_hi)
 
     first_label_ts = ts[t_lo]
     last_label_ts = ts[t_hi]
@@ -537,12 +542,47 @@ def build_sequences_one_symbol(
         if not lbl_mask[t]:  # label time outside feasible window
             continue
 
-        win = g.iloc[t - lookback: t]
+        start_idx = t - lookback
+        if start_idx < 0:
+            if horizons_days:
+                continue
+            start_idx = 0
+
+        win = g.iloc[start_idx: t]
+        pad = lookback - len(win)
+        if pad > 0:
+            if horizons_days:
+                continue
+            if win.empty:
+                continue
+
+            pads = []
+            first_row = win.iloc[[0]].copy()
+            first_ts = pd.to_datetime(first_row[TIME_COL].iloc[0]) if TIME_COL in first_row else None
+            for offset in range(pad, 0, -1):
+                r = first_row.copy()
+                if first_ts is not None:
+                    r.iloc[0, r.columns.get_loc(TIME_COL)] = first_ts - pd.Timedelta(days=offset)
+                pads.append(r)
+            if pads:
+                win = pd.concat(pads + [win], ignore_index=True)
+
         x = win[features].to_numpy(np.float32, copy=True)
+        if len(x) != lookback:
+            if len(x) < lookback:
+                # Ensure we only emit fixed length windows.
+                continue
+            x = x[-lookback:]
         if not np.isfinite(x).all():
             continue
 
-        m = np.ones(lookback, dtype=bool)
+        if pad > 0:
+            m = np.concatenate([
+                np.zeros(pad, dtype=bool),
+                np.ones(lookback - pad, dtype=bool),
+            ])
+        else:
+            m = np.ones(lookback, dtype=bool)
 
         a = logc[t]
         if not np.isfinite(a):
