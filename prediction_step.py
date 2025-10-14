@@ -99,6 +99,8 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
         tcols=tcols,
         mcols=mcols,
         asset2id=asset2id,
+        horizon_days=[],  # inference should not require future label horizons
+        allow_label_fallback=True,
     )
 
     produced = False
