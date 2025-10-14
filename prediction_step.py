@@ -115,8 +115,10 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
         mean_arr[:5].tolist() if mean_arr.size else [],
         std_arr[:5].tolist() if std_arr.size else [],
     )
-    mean_t = torch.from_numpy(mean_arr)
-    std_t  = torch.from_numpy(std_arr)
+    param_example = next(model.parameters(), None)
+    model_dtype = param_example.dtype if param_example is not None else torch.float32
+    mean_t = torch.as_tensor(mean_arr, dtype=model_dtype, device=device)
+    std_t  = torch.as_tensor(std_arr, dtype=model_dtype, device=device).clamp_min(1e-12)
 
     duck_con = _duckdb_connection_or_none(con)
     panel_source = q_panel or None
@@ -148,12 +150,19 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
     with torch.no_grad():
         for sym, X, M, A, _ in tqdm(ds, desc="Iteration"):
             produced = True
-            X = ((X - mean_t) / std_t).unsqueeze(0).to(device)  # [1, T, F]
+            X = X.to(device=device, dtype=model_dtype)
+            X = ((X - mean_t) / std_t).unsqueeze(0)  # [1, T, F]
             M = M.unsqueeze(0).to(device)                       # [1, T]
             A = A.unsqueeze(0).to(device)
             price_x = X[:, :, price_idx]
             fx_x = X[:, :, fx_idx]
-            weather_x = torch.zeros(price_x.size(0), price_x.size(1), 1, device=device)
+            weather_x = torch.zeros(
+                price_x.size(0),
+                price_x.size(1),
+                1,
+                device=device,
+                dtype=model_dtype,
+            )
             news_tokens = {
                 "input_ids": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
                 "attention_mask": torch.zeros(price_x.size(0), price_x.size(1), 1, dtype=torch.long, device=device),
