@@ -101,11 +101,31 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
 
     model.eval()
     heap = []
-    mean_t = torch.from_numpy(np.array(mean))
-    std_t  = torch.from_numpy(np.array(std))
+    mean_arr = np.array(mean)
+    std_arr = np.array(std)
+    __log.info(
+        "score_streaming invoked | symbols=%d as_of_end=%s price_idx=%s fx_idx=%s",
+        len(symbols),
+        as_of_end,
+        price_idx,
+        fx_idx,
+    )
+    __log.info(
+        "Scaler stats preview -> mean[:5]=%s std[:5]=%s",
+        mean_arr[:5].tolist() if mean_arr.size else [],
+        std_arr[:5].tolist() if std_arr.size else [],
+    )
+    mean_t = torch.from_numpy(mean_arr)
+    std_t  = torch.from_numpy(std_arr)
 
     duck_con = _duckdb_connection_or_none(con)
     panel_source = q_panel or None
+    if duck_con is not None:
+        __log.info("Using provided DuckDB connection for panel retrieval")
+    else:
+        __log.info("DuckDB connection unavailable; relying on PanelStreamDataset defaults")
+    if panel_source is not None:
+        __log.info("Panel source override inside score_streaming: %s", panel_source)
 
     ds = PanelStreamDataset(
         symbols=symbols,
@@ -123,6 +143,8 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
     )
 
     produced = False
+    processed = 0
+    top_insertions = 0
     with torch.no_grad():
         for sym, X, M, A, _ in tqdm(ds, desc="Iteration"):
             produced = True
@@ -138,20 +160,43 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
             }
             pred = model(price_x, A, M, fx_x, M, weather_x, M, news_tokens, M)
             lr = float(pred[0, rank_horizon_idx].detach().cpu())
+            processed += 1
+            __log.info(
+                "Scored symbol %s | seq_len=%d | pred=%.6f | rank_h_idx=%d",
+                sym,
+                X.size(1),
+                lr,
+                rank_horizon_idx,
+            )
             item = {"pred_logret": lr, "as_of": str(pd.to_datetime(as_of_end).date())}
             if len(heap) < top_k:
                 heapq.heappush(heap, (lr, sym, item))
+                top_insertions += 1
+                __log.info("Inserted %s into heap (size now %d)", sym, len(heap))
             else:
-                heapq.heappushpop(heap, (lr, sym, item))
+                replaced = heapq.heappushpop(heap, (lr, sym, item))
+                top_insertions += 1
+                __log.info("Pushed %s; heap maintained (popped %s)", sym, replaced[1])
 
     if not produced:
         __log.warning("PanelStreamDataset produced no sequences; check input data and parameters")
+    else:
+        __log.info(
+            "score_streaming completed | processed=%d symbols | heap_updates=%d",
+            processed,
+            top_insertions,
+        )
 
-    return sorted(heap, key=lambda t: t[0], reverse=True)
+    ranked = sorted(heap, key=lambda t: t[0], reverse=True)
+    __log.info("Top results preview: %s", ranked[:5])
+    return ranked
 
 def predict():
     # 0) Load metadata & constants
+    __log.info("Loading metadata from %s", METADATA_PATH)
     meta = json.loads(METADATA_PATH.read_text())
+    __log.info("Metadata keys available: %s", sorted(meta.keys()))
+
     lookback = int(meta.get("lookback"))
     price_idx = list(meta.get("price_idx"))
     fx_idx = meta.get("fx_idx", None)
@@ -159,34 +204,67 @@ def predict():
     q_panel = meta.get("q_panel", None)
     top_k = int(meta.get("top_k", 25))
 
+    __log.info(
+        "Resolved configuration -> lookback: %s | top_k: %s | price_idx: %s | fx_idx: %s",
+        lookback,
+        top_k,
+        price_idx,
+        fx_idx,
+    )
+    if q_panel:
+        __log.info("Custom panel source defined: %s", q_panel)
+    else:
+        __log.info("Using default panel source inside PanelStreamDataset")
+
     # 1) Load model and artifacts
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Missing model at {MODEL_PATH}")
+    __log.info("Loading model architecture from %s", MODEL_PATH)
     model = torch.load(MODEL_PATH.as_posix(), map_location="cpu", weights_only=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    __log.info("Using device: %s (cuda available? %s)", device, torch.cuda.is_available())
     # 2) Load the checkpoint
-    ckpt = torch.load(ART / "model_state.pt", map_location=device)  # safe if file is trusted
+    state_path = ART / "model_state.pt"
+    __log.info("Loading model checkpoint state from %s", state_path)
+    ckpt = torch.load(state_path, map_location=device)  # safe if file is trusted
     state = ckpt.get("model", ckpt)  # if it's a raw state_dict, this still works
 
     # 4) Apply it to the model
     missing, unexpected = model.load_state_dict(state, strict=False)  # strict=True if you want hard fail
-    print("Missing keys:", missing)
-    print("Unexpected keys:", unexpected)
+    if missing:
+        __log.warning("Missing %d keys when loading state dict: %s", len(missing), missing)
+    else:
+        __log.info("No missing keys when loading model state")
+    if unexpected:
+        __log.warning("Encountered %d unexpected keys: %s", len(unexpected), unexpected)
+    else:
+        __log.info("No unexpected keys in checkpoint")
 
     model.to(device).eval()
+    __log.info("Model moved to %s and set to eval mode", device)
 
     mean, std = _load_mean_std(SCALER_PATH)
+    __log.info("Loaded scaler stats with %d mean entries and %d std entries", len(mean), len(std))
     symbols = _load_json_list(SYMBOLS_PATH)
     features = _load_json_list(FEATURES_PATH)
     tcols = _load_json_list(TCOLS_PATH)
     mcols = _load_json_list(MCOLS_PATH)
     asset2id = _maybe_load_asset2id(ASSET2ID_PATH)
+    __log.info(
+        "Loaded %d symbols, %d features, %d temporal cols, %d meta cols, asset2id available? %s",
+        len(symbols),
+        len(features),
+        len(tcols),
+        len(mcols),
+        asset2id is not None,
+    )
 
     cal_df = pd.read_csv(CALENDAR_PATH)
     if "date" not in cal_df.columns:
         raise ValueError("calendar.csv must contain a 'date' column")
     cal = pd.to_datetime(cal_df["date"]).sort_values(ignore_index=True)
     rank_h_idx = len(cal) - 1
+    __log.info("Loaded calendar with %d entries; ranking horizon index=%d", len(cal), rank_h_idx)
 
     as_of_end = pd.Timestamp.today().normalize()
     ignore_days = getattr(args, "ignore_days", 0) or 0
@@ -201,8 +279,18 @@ def predict():
 
     # 2) Connection (optional) built from metadata
     con = _build_con_from_meta(meta)
+    if con is None:
+        __log.info("No external DB connection established; relying on internal data sources")
+    else:
+        __log.info("Successfully built external DB/duckdb connection: %s", type(con))
 
     # 3) Score
+    __log.info(
+        "Scoring streaming predictions over %d symbols with lookback=%d and top_k=%d",
+        len(symbols),
+        lookback,
+        top_k,
+    )
     top = score_streaming(
         model=model,
         device=device,
@@ -229,6 +317,7 @@ def predict():
     )
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     pred_df.to_csv(OUTPUT_CSV, index=False)
+    __log.info("Persisted predictions to %s (%d rows)", OUTPUT_CSV, len(pred_df))
 
     # 5) Optional persistence to Mongo (only if metadata contains settings)
     _maybe_persist_to_mongo(pred_df, meta, top_k)
