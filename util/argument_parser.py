@@ -31,7 +31,7 @@ def parse_args() -> Namespace:
     p.add_argument("--lr", type=float, default=float(os.getenv("LR", 7e-4)))
     p.add_argument("--dropout", type=float, default=float(os.getenv("DROPOUT", 0.15)))
     p.add_argument("--layers", type=int, default=int(os.getenv("LAYERS", 2)))
-    p.add_argument("--hidden", type=int, default=int(os.getenv("HIDDEN", 256)))
+    p.add_argument("--hidden", type=int, default=int(os.getenv("HIDDEN", 128)))
     p.add_argument("--weight-decay", type=float, default=float(os.getenv("WEIGHT_DECAY", 1e-4)))
     p.add_argument("--seed", type=int, default=int(os.getenv("SEED", 42)))
     p.add_argument("--num-workers", type=int, default=int(os.getenv("NUM_WORKERS", 1)))

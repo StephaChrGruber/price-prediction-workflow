@@ -15,3 +15,4 @@ joblib
 psutil
 duckdb
 transformers
+sqlalchemy

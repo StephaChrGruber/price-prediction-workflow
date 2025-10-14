@@ -1,11 +1,15 @@
 import copy
 import datetime
 import gc
+import json
 import logging
 import os
+import platform
+import subprocess
 import sys
 from argparse import Namespace
-from typing import List
+from pathlib import Path
+from typing import List, Sequence, Optional, Mapping, Any
 
 import pandas as pd
 import numpy as np
@@ -492,13 +496,11 @@ def build_sequences_one_symbol(df, lookback, features, horizons_days, label_star
 
     hmax = max(horizons_days) if horizons_days else 0
     L = len(g)
-    if L < lookback + hmax + 1:
-        return None
 
     sym_first = ts[0]
     sym_last = ts[-1]
-    eff_start = max(pd.to_datetime(label_start), sym_first + pd.Timedelta(days=lookback - 1))
-    eff_end = min(pd.to_datetime(label_end), sym_last - pd.Timedelta(days=hmax))
+    eff_start = pd.to_datetime(label_start)
+    eff_end = pd.to_datetime(label_end)
     if eff_end < eff_start:
         return None
 
@@ -680,6 +682,178 @@ def _diagnose_symbol(df, sym, lookback, horizons_days, label_start, label_end):
             f"sym_range=[{str(sym_first)},{str(sym_last)}], "
             f"eff_lbl=[{str(eff_start.date())},{str(eff_end.date())}]")
 
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _to_list(x: Any) -> list:
+    # Robustly convert numpy/pandas to plain Python lists for JSON
+    if isinstance(x, (np.ndarray,)):
+        return x.tolist()
+    if isinstance(x, (pd.Series, pd.Index)):
+        return x.astype(object).tolist()
+    if isinstance(x, pd.DataFrame):
+        return x.values.tolist()
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    # fallback
+    return [x]
+
+
+def _save_json(p: Path, obj: Any) -> None:
+    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def _get_git_info() -> dict:
+    info = {}
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+        remote = subprocess.check_output(["git", "config", "--get", "remote.origin.url"], text=True).strip()
+        info.update({"commit": commit, "branch": branch, "remote": remote})
+    except Exception:
+        pass
+    return info
+
+
+def save_training_artifacts(
+    *,
+    model: torch.nn.Module,
+    # Either pass a scaler with finalize(), or pass mean/std directly:
+    scaler: Optional[Any] = None,
+    mean: Optional[Sequence[float]] = None,
+    std: Optional[Sequence[float]] = None,
+
+    # Data/config pieces used by prediction:
+    cal: pd.DatetimeIndex | Sequence[pd.Timestamp | str],
+    symbols: Sequence[str],
+    features: Sequence[str],
+    tcols: Sequence[str],
+    mcols: Sequence[str],
+    asset2id: Optional[Mapping[str, int]] = None,
+
+    # Indices / hyperparams that the prediction step needs:
+    price_idx: Sequence[int],
+    fx_idx: Optional[Sequence[int]],
+    lookback: int,
+
+    # Helpful for prediction defaulting/logging:
+    q_panel_path: Optional[str | Path] = None,
+
+    # For model reconstruction (if you prefer loading state_dict):
+    model_class_path: Optional[str] = None,  # e.g. "yourpkg.models.MyModel"
+    model_hparams: Optional[Mapping[str, Any]] = None,
+
+    # Output location:
+    out_dir: str | Path = "artifacts",
+
+    # Optional: also export a TorchScript module (requires example input)
+    torchscript_example: Optional[tuple[Any, ...]] = None,  # e.g., (X, M) or (X,)
+) -> dict:
+    """
+    Save all artifacts needed for a fully standalone prediction step.
+
+    Returns a dict with absolute paths of the saved files.
+    """
+    out = Path(out_dir)
+    _ensure_dir(out)
+
+    # ---- 1) Save scaler mean/std ----
+    if scaler is not None:
+        try:
+            mean_, std_ = scaler.finalize()
+        except AttributeError:
+            raise ValueError("Provided scaler has no .finalize(). Pass mean/std directly instead.")
+    else:
+        if mean is None or std is None:
+            raise ValueError("Either pass a scaler with .finalize() or provide mean and std.")
+        mean_, std_ = mean, std
+
+    scaler_path = out / "scaler.json"
+    _save_json(scaler_path, {"mean": _to_list(mean_), "std": _to_list(std_)})
+
+    # ---- 2) Save calendar ----
+    cal_list = pd.to_datetime(pd.Index(cal)).sort_values().strftime("%Y-%m-%d").tolist()
+    cal_df = pd.DataFrame({"date": cal_list})
+    cal_path = out / "calendar.csv"
+    cal_df.to_csv(cal_path, index=False)
+
+    # ---- 3) Save lists / maps ----
+    symbols_path = out / "symbols.json"
+    features_path = out / "features.json"
+    tcols_path = out / "tcols.json"
+    mcols_path = out / "mcols.json"
+
+    _save_json(symbols_path, list(map(str, symbols)))
+    _save_json(features_path, list(map(str, features)))
+    _save_json(tcols_path, list(map(str, tcols)))
+    _save_json(mcols_path, list(map(str, mcols)))
+
+    asset2id_path = None
+    if asset2id is not None:
+        asset2id_path = out / "asset2id.json"
+        _save_json(asset2id_path, {str(k): int(v) for k, v in asset2id.items()})
+
+    # ---- 4) Save the model in multiple formats ----
+    # 4a) Entire object (simple torch.load)
+    model_pt_path = out / "model.pt"
+    torch.save(model, model_pt_path.as_posix())
+
+    # 4b) state_dict + config (safer across code changes)
+    model_state_path = out / "model_state.pt"
+    torch.save(model.state_dict(), model_state_path.as_posix())
+
+    model_config_path = out / "model_config.json"
+    _save_json(
+        model_config_path,
+        {
+            "class": model_class_path,            # e.g., "yourpkg.models.MyModel"
+            "hparams": dict(model_hparams or {}), # e.g., {"d_model": 256, ...}
+        },
+    )
+
+    # 4c) Optional: TorchScript (script or trace)
+    model_scripted_path = None
+    if torchscript_example is not None:
+        try:
+            # Prefer scripting (works for most nn.Modules with Python control flow)
+            scripted = torch.jit.script(model)
+        except Exception:
+            # Fallback to tracing if scripting fails (requires example inputs)
+            scripted = torch.jit.trace(model, torchscript_example)
+        model_scripted_path = out / "model_scripted.pt"
+        scripted.save(model_scripted_path.as_posix())
+
+    # ---- 5) Save metadata ----
+    meta = {
+        "created_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "lookback": lookback,
+        "price_idx": price_idx,
+        "fx_idx": (None if fx_idx is None else fx_idx),
+        "q_panel": str(q_panel_path) if q_panel_path is not None else None,
+    }
+    meta.update({"git": _get_git_info()})
+    metadata_path = out / "metadata.json"
+    _save_json(metadata_path, meta)
+
+    return {
+        "scaler": str(scaler_path.resolve()),
+        "calendar": str(cal_path.resolve()),
+        "symbols": str(symbols_path.resolve()),
+        "features": str(features_path.resolve()),
+        "tcols": str(tcols_path.resolve()),
+        "mcols": str(mcols_path.resolve()),
+        "asset2id": (None if asset2id_path is None else str(asset2id_path.resolve())),
+        "model_pt": str(model_pt_path.resolve()),
+        "model_state": str(model_state_path.resolve()),
+        "model_config": str(model_config_path.resolve()),
+        "model_scripted": (None if model_scripted_path is None else str(model_scripted_path.resolve())),
+        "metadata": str(metadata_path.resolve()),
+    }
+
 
 # B) Second pass: training with scaling applied on the fly
 class ScaledWrapper(IterableDataset):
@@ -810,7 +984,34 @@ def train():
     rank_h_idx = len(cal) - 1
     mean, std = trained_mean, trained_std
 
-    top = score_streaming(
+    model_class_path = "yourpkg.models.MyModel"
+
+    paths = save_training_artifacts(
+        model=model,
+        scaler=scaler,  # or pass mean=..., std=... if you don't keep the scaler object
+        cal=cal,
+        symbols=symbols,
+        features=features,
+        tcols=tcols,
+        mcols=mcols,
+        asset2id=asset2id,
+        price_idx=price_idx,
+        fx_idx=fx_idx,
+        lookback=args.lookback,
+        q_panel_path=Path(q_file),
+
+        # Optional if you want to reconstruct from state_dict:
+        model_class_path=model_class_path,
+
+        # Optional TorchScript (requires an example input tuple)
+        # torchscript_example=(example_X, example_M),
+
+        out_dir="artifacts",
+    )
+
+    print("Saved artifacts:", paths)
+
+    """top = score_streaming(
         model=model, device=device, con=con, q_panel=q_file,
         symbols=symbols, as_of_end=as_of_end, lookback=args.lookback,
         features=features, tcols=tcols, mcols=mcols,
@@ -823,7 +1024,7 @@ def train():
     pred_df = pd.DataFrame(
         [{"symbol": s, "pred_1y_logret": lr, "as_of": item["as_of"]} for lr, s, item in top]
     )
-    persist_topk_to_mongo(pred_df, 25)
+    persist_topk_to_mongo(pred_df, 25)"""
 
 def main():
     __log.info("Starting up training step")
