@@ -479,7 +479,16 @@ def reduce_daily_duplicates(g: pd.DataFrame) -> pd.DataFrame:
         g = g[cols].groupby(TIME_COL, as_index=False).agg({c: rules[c] for c in cols if c != TIME_COL})
     return g
 
-def build_sequences_one_symbol(df, lookback, features, horizons_days, label_start, label_end):
+def build_sequences_one_symbol(
+    df,
+    lookback,
+    features,
+    horizons_days,
+    label_start,
+    label_end,
+    *,
+    allow_label_fallback=False,
+):
     g = df.sort_values(TIME_COL).copy()
     ts = pd.to_datetime(g[TIME_COL]).to_numpy()
 
@@ -497,15 +506,29 @@ def build_sequences_one_symbol(df, lookback, features, horizons_days, label_star
     hmax = max(horizons_days) if horizons_days else 0
     L = len(g)
 
-    sym_first = ts[0]
-    sym_last = ts[-1]
-    eff_start = pd.to_datetime(label_start)
-    eff_end = pd.to_datetime(label_end)
-    if eff_end < eff_start:
-        return None
+    req_start = pd.to_datetime(label_start)
+    req_end = pd.to_datetime(label_end)
 
     t_lo = lookback
     t_hi = L - 1 - hmax
+    if t_hi < t_lo:
+        return None
+
+    first_label_ts = ts[t_lo]
+    last_label_ts = ts[t_hi]
+
+    eff_start = max(req_start, first_label_ts)
+    eff_end = min(req_end, last_label_ts)
+
+    if eff_end < eff_start:
+        # For inference we may request a label date that is newer than the
+        # underlying parquet contains. When allowed, fall back to the most
+        # recent available label so we can still emit a sequence.
+        if allow_label_fallback and req_start > last_label_ts:
+            eff_start = eff_end = last_label_ts
+        else:
+            return None
+
     lbl_mask = (ts >= eff_start) & (ts <= eff_end)
 
     Xs, Ms, Ys = [], [], []
@@ -524,20 +547,27 @@ def build_sequences_one_symbol(df, lookback, features, horizons_days, label_star
         if not np.isfinite(a):
             continue
 
-        y = []
-        ok = True
-        for H in horizons_days:
-            b = logc[t + H]
-            if not np.isfinite(b):
-                ok = False
-                break
-            y.append(np.float32(b - a))
-        if not ok:
-            continue
+        if horizons_days:
+            y = []
+            ok = True
+            for H in horizons_days:
+                b = logc[t + H]
+                if not np.isfinite(b):
+                    ok = False
+                    break
+                y.append(np.float32(b - a))
+            if not ok:
+                continue
+            Y = np.asarray(y, dtype=np.float32)
+        else:
+            # In inference we don't require future labels; emit an empty target
+            # vector so downstream code can ignore it while still receiving the
+            # sequence features.
+            Y = np.empty((0,), dtype=np.float32)
 
         Xs.append(x)
         Ms.append(m)
-        Ys.append(np.asarray(y, dtype=np.float32))
+        Ys.append(Y)
 
     if not Xs:
         return None
@@ -547,7 +577,20 @@ def build_sequences_one_symbol(df, lookback, features, horizons_days, label_star
 
 class PanelStreamDataset(IterableDataset):
 
-    def __init__(self, symbols, start, end, lookback, features, tcols, mcols, asset2id, horizon_days = [7, 30, 182, 365]):
+    def __init__(
+        self,
+        symbols,
+        start,
+        end,
+        lookback,
+        features,
+        tcols,
+        mcols,
+        asset2id,
+        horizon_days=[7, 30, 182, 365],
+        *,
+        allow_label_fallback=False,
+    ):
         super().__init__()
         self.symbols = list(symbols)
         self.start = pd.to_datetime(start)
@@ -559,6 +602,7 @@ class PanelStreamDataset(IterableDataset):
         self.mcols = mcols
         self.asset2id = asset2id
         self.horizon_days = horizon_days
+        self.allow_label_fallback = allow_label_fallback
 
     def __iter__(self):
         con = _get_duck()  # per-worker duckdb connection (as in earlier fix)
@@ -586,12 +630,15 @@ class PanelStreamDataset(IterableDataset):
                 continue
             df[TIME_COL] = pd.to_datetime(df[TIME_COL]).dt.normalize()
 
-            seqs = build_sequences_one_symbol(df,
-                                  lookback=self.lookback,
-                                  features=self.features,
-                                  horizons_days=self.horizon_days,
-                                  label_start=self.start,
-                                  label_end=self.end)
+            seqs = build_sequences_one_symbol(
+                df,
+                lookback=self.lookback,
+                features=self.features,
+                horizons_days=self.horizon_days,
+                label_start=self.start,
+                label_end=self.end,
+                allow_label_fallback=self.allow_label_fallback,
+            )
             if seqs is None:
                 continue
             X, M, Y = seqs
