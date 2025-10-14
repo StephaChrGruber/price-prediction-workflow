@@ -168,7 +168,17 @@ def predict():
         raise ValueError("calendar.csv must contain a 'date' column")
     cal = pd.to_datetime(cal_df["date"]).sort_values(ignore_index=True)
     rank_h_idx = len(cal) - 1
+
     as_of_end = pd.Timestamp.today().normalize()
+    ignore_days = getattr(args, "ignore_days", 0) or 0
+    if ignore_days > 0:
+        as_of_end = as_of_end - pd.Timedelta(days=ignore_days)
+
+    earliest_calendar = pd.to_datetime(cal.iloc[0]).normalize()
+    if as_of_end < earliest_calendar:
+        as_of_end = earliest_calendar
+
+    __log.info("Using %s as evaluation cutoff", as_of_end.date())
 
     # 2) Connection (optional) built from metadata
     con = _build_con_from_meta(meta)
