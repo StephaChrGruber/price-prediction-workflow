@@ -23,7 +23,7 @@ from torch.utils.data import IterableDataset
 
 from util.constants import SYMBOL_COL, TIME_COL, EPS
 from util.data_utils import mongo_client
-from util.diagnostics import setup_diagnostics, disable_diagnostics, set_seed, __log
+from util.diagnostics import setup_diagnostics, disable_diagnostics, set_seed
 import torch.nn as nn
 from util.multimodal_model import PriceEncoder, FXEncoder, MultiModalPriceForecast
 
