@@ -35,6 +35,7 @@ logging.basicConfig(
 )
 
 __log = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 args: Namespace
 
@@ -637,7 +638,7 @@ class PanelStreamDataset(IterableDataset):
 
     def __iter__(self):
         con = self.duckdb_con if self.duckdb_con is not None else _get_duck()
-        __log.info(
+        log.info(
             "PanelStreamDataset iterator initialized | start=%s end=%s lookback=%s symbols=%d horizon_days=%s",
             self.start,
             self.end,
@@ -653,7 +654,7 @@ class PanelStreamDataset(IterableDataset):
         hpad = max(self.horizon_days) if self.horizon_days else 0
         for sym in self.symbols:
             fpad = pd.Timedelta(days=hpad)
-            __log.info(
+            log.info(
                 "Querying symbol %s with start=%s end=%s (fetch pad=%s horizon_pad=%s)",
                 sym,
                 (self.start - self.lbpad),
@@ -674,10 +675,10 @@ class PanelStreamDataset(IterableDataset):
             #logging.getLogger(__name__).info("[val diag] " + info)
 
             if df.empty:
-                __log.warning("No rows returned for symbol %s", sym)
+                log.warning("No rows returned for symbol %s", sym)
                 continue
             df[TIME_COL] = pd.to_datetime(df[TIME_COL]).dt.normalize()
-            __log.info(
+            log.info(
                 "Fetched %d rows for %s spanning [%s, %s]",
                 len(df),
                 sym,
@@ -695,12 +696,12 @@ class PanelStreamDataset(IterableDataset):
                 allow_label_fallback=self.allow_label_fallback,
             )
             if seqs is None:
-                __log.warning("Failed to build sequences for symbol %s", sym)
+                log.warning("Failed to build sequences for symbol %s", sym)
                 continue
             X, M, Y = seqs
             aid = int(self.asset2id.get(sym, 0))
             A = torch.tensor(aid, dtype=torch.long)  # constant per symbol
-            __log.info(
+            log.info(
                 "Built %d sequences for %s with X shape %s, M shape %s, Y shape %s",
                 len(X),
                 sym,
