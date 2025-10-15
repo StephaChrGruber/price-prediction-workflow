@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import sys
 from argparse import Namespace
 from math import exp
@@ -229,6 +230,16 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
     __log.info("Top results preview: %s", ranked[:5])
     return ranked
 
+
+def _infer_horizon_days_from_tcols(tcols: Sequence[str]) -> list[int]:
+    horizons: list[int] = []
+    for col in tcols:
+        match = re.search(r"(\d+)d$", str(col))
+        if match:
+            horizons.append(int(match.group(1)))
+    return horizons
+
+
 def predict():
     # 0) Load metadata & constants
     __log.info("Loading metadata from %s", METADATA_PATH)
@@ -298,28 +309,79 @@ def predict():
     )
 
     cal_df = pd.read_csv(CALENDAR_PATH)
-    if "date" not in cal_df.columns:
-        raise ValueError("calendar.csv must contain a 'date' column")
-    cal = pd.to_datetime(cal_df["date"]).sort_values(ignore_index=True)
-    rank_h_idx = len(cal) - 1
-    target_price_date = pd.to_datetime(cal.iloc[rank_h_idx]) if len(cal) else None
-    __log.info(
-        "Loaded calendar with %d entries; ranking horizon index=%d; target price date=%s",
-        len(cal),
-        rank_h_idx,
-        target_price_date.date() if isinstance(target_price_date, pd.Timestamp) else None,
-    )
+    cal_dates: Optional[pd.Series] = None
+    horizon_days: Optional[list[int]] = None
+
+    if "horizon_days" in cal_df.columns:
+        horizons_series = pd.to_numeric(cal_df["horizon_days"], errors="coerce")
+        if horizons_series.isna().any():
+            raise ValueError("calendar.csv has non-numeric entries in 'horizon_days'")
+        horizon_days = horizons_series.astype(int).tolist()
+        __log.info("Loaded horizon offsets from calendar: %s", horizon_days)
+    elif "date" in cal_df.columns:
+        cal_dates = pd.to_datetime(cal_df["date"], errors="coerce").dropna().sort_values(ignore_index=True)
+        if cal_dates.empty:
+            raise ValueError("calendar.csv has no parseable dates")
+        if cal_dates.dt.year.eq(1970).all():
+            __log.warning(
+                "Calendar dates appear to be Unix epoch (likely encoded horizon offsets); "
+                "falling back to inferring horizons from target column names."
+            )
+            cal_dates = None
+            horizon_days = _infer_horizon_days_from_tcols(tcols)
+        else:
+            __log.info(
+                "Loaded calendar with %d entries; first=%s last=%s",
+                len(cal_dates),
+                cal_dates.iloc[0].date(),
+                cal_dates.iloc[-1].date(),
+            )
+    else:
+        __log.warning("calendar.csv missing expected columns; inferring horizons from target columns")
+        horizon_days = _infer_horizon_days_from_tcols(tcols)
+
+    if horizon_days is None or len(horizon_days) == 0:
+        if cal_dates is None or len(cal_dates) == 0:
+            raise ValueError("Unable to determine prediction horizons from calendar or target columns")
+        rank_h_idx = len(cal_dates) - 1
+        target_price_date = cal_dates.iloc[rank_h_idx]
+    else:
+        rank_h_idx = len(horizon_days) - 1
+        target_price_date = None  # computed after resolving as_of_end
+        inferred_from_tcols = _infer_horizon_days_from_tcols(tcols)
+        if inferred_from_tcols and len(inferred_from_tcols) != len(horizon_days):
+            __log.warning(
+                "Mismatch between calendar horizons (%d) and target columns (%d)",
+                len(horizon_days),
+                len(inferred_from_tcols),
+            )
 
     as_of_end = pd.Timestamp.today().normalize()
     ignore_days = getattr(args, "ignore_days", 0) or 0
     if ignore_days > 0:
         as_of_end = as_of_end - pd.Timedelta(days=ignore_days)
 
-    earliest_calendar = pd.to_datetime(cal.iloc[0]).normalize()
-    if as_of_end < earliest_calendar:
-        as_of_end = earliest_calendar
+    if cal_dates is not None and len(cal_dates):
+        earliest_calendar = cal_dates.iloc[0].normalize()
+        if as_of_end < earliest_calendar:
+            as_of_end = earliest_calendar
 
     __log.info("Using %s as evaluation cutoff", as_of_end.date())
+
+    if horizon_days is not None and len(horizon_days):
+        target_price_date = as_of_end + pd.to_timedelta(horizon_days[rank_h_idx], unit="D")
+        __log.info(
+            "Resolved horizon offsets -> rank_h_idx=%d horizon_days=%s target_price_date=%s",
+            rank_h_idx,
+            horizon_days,
+            target_price_date.date(),
+        )
+    else:
+        __log.info(
+            "Resolved calendar dates -> rank_h_idx=%d target_price_date=%s",
+            rank_h_idx,
+            target_price_date.date() if isinstance(target_price_date, pd.Timestamp) else None,
+        )
 
     # 2) Connection (optional) built from metadata
     con = _build_con_from_meta(meta)

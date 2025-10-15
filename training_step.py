@@ -925,8 +925,20 @@ def save_training_artifacts(
     _save_json(scaler_path, {"mean": _to_list(mean_), "std": _to_list(std_)})
 
     # ---- 2) Save calendar ----
-    cal_list = pd.to_datetime(pd.Index(cal)).sort_values().strftime("%Y-%m-%d").tolist()
-    cal_df = pd.DataFrame({"date": cal_list})
+    cal_index = pd.Index(cal)
+    # If horizons are provided as numeric offsets (common in this workflow),
+    # persist them explicitly instead of accidentally interpreting them as
+    # absolute datetimes (which defaults to the Unix epoch 1970-01-01).
+    if cal_index.inferred_type in {"integer", "floating"}:
+        cal_series = pd.to_numeric(cal_index, errors="coerce").astype(int)
+        cal_df = pd.DataFrame({"horizon_days": pd.Series(cal_series).sort_values().tolist()})
+    else:
+        # Fallback to treating entries as concrete dates.
+        cal_series = pd.to_datetime(cal_index, errors="coerce")
+        if cal_series.isna().any():
+            raise ValueError("Calendar entries must be numeric horizons or parseable dates")
+        cal_list = cal_series.sort_values().strftime("%Y-%m-%d").tolist()
+        cal_df = pd.DataFrame({"date": cal_list})
     cal_path = out / "calendar.csv"
     cal_df.to_csv(cal_path, index=False)
 
