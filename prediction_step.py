@@ -8,6 +8,7 @@ from argparse import Namespace
 from math import exp
 from pathlib import Path
 from typing import Optional, Mapping, Any, Sequence
+from collections import OrderedDict
 import pandas as pd
 import torch
 import numpy as np
@@ -38,6 +39,13 @@ MCOLS_PATH     = ART / "mcols.json"
 ASSET2ID_PATH  = ART / "asset2id.json"     # optional
 METADATA_PATH  = ART / "metadata.json"
 OUTPUT_CSV     = ART / "predictions.csv"
+
+DESIRED_HORIZONS = OrderedDict({
+    "1w": 7,
+    "1m": 30,
+    "6m": 182,
+    "1y": 365,
+})
 
 def _load_json_list(p: Path) -> list[str]:
     return list(map(str, json.loads(p.read_text())))
@@ -79,6 +87,52 @@ def _maybe_persist_to_mongo(df: pd.DataFrame, meta: Mapping[str, Any], top_k: in
         col.insert_many(docs)
 
 
+def _nearest_positive_index(values: Sequence[int], target: int) -> Optional[int]:
+    best_idx: Optional[int] = None
+    best_diff: Optional[int] = None
+    for idx, val in enumerate(values):
+        if val <= 0:
+            continue
+        diff = abs(val - target)
+        if best_diff is None or diff < best_diff:
+            best_idx = idx
+            best_diff = diff
+    return best_idx
+
+
+def _build_horizon_context(
+    horizon_days: Optional[Sequence[int]],
+    cal_dates: Optional[pd.Series],
+    as_of_end: pd.Timestamp,
+    rank_horizon_idx: int,
+) -> dict[str, dict[str, Any]]:
+    if horizon_days:
+        offsets = list(map(int, horizon_days))
+        dates = [as_of_end + pd.to_timedelta(off, unit="D") for off in offsets]
+    elif cal_dates is not None and len(cal_dates):
+        dates = [pd.to_datetime(d) for d in cal_dates]
+        offsets = [(d.normalize() - as_of_end.normalize()).days for d in dates]
+    else:
+        return {}
+
+    context: dict[str, dict[str, Any]] = {}
+    for label, desired in DESIRED_HORIZONS.items():
+        if label == "1y" and 0 <= rank_horizon_idx < len(offsets):
+            idx = rank_horizon_idx
+        else:
+            idx = _nearest_positive_index(offsets, desired)
+        if idx is None:
+            __log.warning("No matching horizon found for %s (desired %dd)", label, desired)
+            continue
+        context[label] = {
+            "index": idx,
+            "offset_days": int(offsets[idx]),
+            "date": dates[idx],
+        }
+
+    return context
+
+
 def _duckdb_connection_or_none(con: Any) -> Optional[Any]:
     if con is None:
         return None
@@ -95,7 +149,8 @@ def _duckdb_connection_or_none(con: Any) -> Optional[Any]:
 def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                     lookback, features, tcols, mcols, mean, std,
                     price_idx, fx_idx, top_k=25, rank_horizon_idx=-1,
-                    asset2id=None, target_price_date: Optional[pd.Timestamp] = None):
+                    asset2id=None, target_price_date: Optional[pd.Timestamp] = None,
+                    horizon_context: Optional[Mapping[str, Mapping[str, Any]]] = None):
     """
     Returns a list of (rank_value, symbol, extra) for the top_k symbols.
     rank_horizon_idx: which horizon to rank by (e.g., -1 = last horizon like 1y)
@@ -201,12 +256,33 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                 lr,
                 rank_horizon_idx,
             )
+            horizon_outputs: dict[str, dict[str, Any]] = {}
+            if horizon_context:
+                for label, info in horizon_context.items():
+                    idx = info.get("index")
+                    if idx is None or idx >= pred.size(-1):
+                        continue
+                    val = float(pred[0, idx].detach().cpu())
+                    exp_price = None
+                    if current_price is not None and current_price > 0:
+                        exp_price = current_price * exp(val)
+                    info_date = info.get("date")
+                    expected_date = None
+                    if info_date is not None:
+                        expected_date = str(pd.to_datetime(info_date).date())
+                    horizon_outputs[label] = {
+                        "logret": val,
+                        "expected_price": exp_price,
+                        "expected_price_date": expected_date,
+                    }
+
             item = {
                 "pred_logret": lr,
                 "as_of": str(pd.to_datetime(as_of_end).date()),
                 "current_price": current_price,
                 "expected_price": expected_price,
                 "expected_price_date": target_price_date_str,
+                "horizon_outputs": horizon_outputs,
             }
             if len(heap) < top_k:
                 heapq.heappush(heap, (lr, sym, item))
@@ -383,6 +459,21 @@ def predict():
             target_price_date.date() if isinstance(target_price_date, pd.Timestamp) else None,
         )
 
+    horizon_context = _build_horizon_context(horizon_days, cal_dates, as_of_end, rank_h_idx)
+    if horizon_context:
+        context_preview = {
+            label: {
+                "index": info.get("index"),
+                "offset_days": info.get("offset_days"),
+                "date": str(info.get("date").date()) if isinstance(info.get("date"), pd.Timestamp) else None,
+            }
+            for label, info in horizon_context.items()
+        }
+        __log.info("Resolved horizon context: %s", context_preview)
+        one_year = horizon_context.get("1y")
+        if one_year and isinstance(one_year.get("date"), pd.Timestamp):
+            target_price_date = one_year["date"]
+
     # 2) Connection (optional) built from metadata
     con = _build_con_from_meta(meta)
     if con is None:
@@ -416,17 +507,38 @@ def predict():
         rank_horizon_idx=rank_h_idx,
         asset2id=asset2id,
         target_price_date=target_price_date,
+        horizon_context=horizon_context,
     )
 
     # 4) Format + save
+    def _extract_h(item: Mapping[str, Any], label: str, key: str, default=None):
+        horizon_data = item.get("horizon_outputs", {}) if isinstance(item, Mapping) else {}
+        value = None
+        if isinstance(horizon_data, Mapping):
+            slot = horizon_data.get(label)
+            if isinstance(slot, Mapping):
+                value = slot.get(key)
+        return value if value is not None else default
+
     pred_df = pd.DataFrame([
         {
             "symbol": s,
-            "pred_1y_logret": lr,
+            "pred_1w_logret": _extract_h(item, "1w", "logret"),
+            "pred_1m_logret": _extract_h(item, "1m", "logret"),
+            "pred_6m_logret": _extract_h(item, "6m", "logret"),
+            "pred_1y_logret": _extract_h(item, "1y", "logret", default=lr),
             "as_of": item["as_of"],
             "current_price": item.get("current_price"),
             "expected_price": item.get("expected_price"),
+            "expected_price_1w": _extract_h(item, "1w", "expected_price"),
+            "expected_price_1m": _extract_h(item, "1m", "expected_price"),
+            "expected_price_6m": _extract_h(item, "6m", "expected_price"),
+            "expected_price_1y": _extract_h(item, "1y", "expected_price", default=item.get("expected_price")),
             "expected_price_date": item.get("expected_price_date"),
+            "expected_price_date_1w": _extract_h(item, "1w", "expected_price_date"),
+            "expected_price_date_1m": _extract_h(item, "1m", "expected_price_date"),
+            "expected_price_date_6m": _extract_h(item, "6m", "expected_price_date"),
+            "expected_price_date_1y": _extract_h(item, "1y", "expected_price_date", default=item.get("expected_price_date")),
         }
         for lr, s, item in top
     ])
