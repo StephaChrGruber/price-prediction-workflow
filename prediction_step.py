@@ -4,6 +4,7 @@ import os
 import pickle
 import sys
 from argparse import Namespace
+from math import exp
 from pathlib import Path
 from typing import Optional, Mapping, Any, Sequence
 import pandas as pd
@@ -92,7 +93,8 @@ def _duckdb_connection_or_none(con: Any) -> Optional[Any]:
 
 def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                     lookback, features, tcols, mcols, mean, std,
-                    price_idx, fx_idx, top_k=25, rank_horizon_idx=-1, asset2id=None):
+                    price_idx, fx_idx, top_k=25, rank_horizon_idx=-1,
+                    asset2id=None, target_price_date: Optional[pd.Timestamp] = None):
     """
     Returns a list of (rank_value, symbol, extra) for the top_k symbols.
     rank_horizon_idx: which horizon to rank by (e.g., -1 = last horizon like 1y)
@@ -147,9 +149,14 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
     produced = False
     processed = 0
     top_insertions = 0
+    target_price_date_str = None
+    if target_price_date is not None:
+        target_price_date_str = str(pd.to_datetime(target_price_date).date())
+
     with torch.no_grad():
         for sym, X, M, A, _ in tqdm(ds, desc="Iteration"):
             produced = True
+            raw_X = X.clone()
             X = X.to(device=device, dtype=model_dtype)
             X = ((X - mean_t) / std_t).unsqueeze(0)  # [1, T, F]
             M = M.unsqueeze(0).to(device)                       # [1, T]
@@ -170,6 +177,22 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
             pred = model(price_x, A, M, fx_x, M, weather_x, M, news_tokens, M)
             lr = float(pred[0, rank_horizon_idx].detach().cpu())
             processed += 1
+            current_price = None
+            base_price_idx = None
+            if isinstance(price_idx, Sequence) and len(price_idx) > 0:
+                base_price_idx = price_idx[0]
+            elif isinstance(price_idx, int):
+                base_price_idx = price_idx
+            if base_price_idx is not None:
+                try:
+                    current_price = float(raw_X[-1, base_price_idx].item())
+                except (IndexError, ValueError):
+                    current_price = None
+            if current_price is not None and not np.isfinite(current_price):
+                current_price = None
+            expected_price = None
+            if current_price is not None and current_price > 0:
+                expected_price = current_price * exp(lr)
             __log.info(
                 "Scored symbol %s | seq_len=%d | pred=%.6f | rank_h_idx=%d",
                 sym,
@@ -177,7 +200,13 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                 lr,
                 rank_horizon_idx,
             )
-            item = {"pred_logret": lr, "as_of": str(pd.to_datetime(as_of_end).date())}
+            item = {
+                "pred_logret": lr,
+                "as_of": str(pd.to_datetime(as_of_end).date()),
+                "current_price": current_price,
+                "expected_price": expected_price,
+                "expected_price_date": target_price_date_str,
+            }
             if len(heap) < top_k:
                 heapq.heappush(heap, (lr, sym, item))
                 top_insertions += 1
@@ -273,7 +302,13 @@ def predict():
         raise ValueError("calendar.csv must contain a 'date' column")
     cal = pd.to_datetime(cal_df["date"]).sort_values(ignore_index=True)
     rank_h_idx = len(cal) - 1
-    __log.info("Loaded calendar with %d entries; ranking horizon index=%d", len(cal), rank_h_idx)
+    target_price_date = pd.to_datetime(cal.iloc[rank_h_idx]) if len(cal) else None
+    __log.info(
+        "Loaded calendar with %d entries; ranking horizon index=%d; target price date=%s",
+        len(cal),
+        rank_h_idx,
+        target_price_date.date() if isinstance(target_price_date, pd.Timestamp) else None,
+    )
 
     as_of_end = pd.Timestamp.today().normalize()
     ignore_days = getattr(args, "ignore_days", 0) or 0
@@ -318,12 +353,21 @@ def predict():
         top_k=top_k,
         rank_horizon_idx=rank_h_idx,
         asset2id=asset2id,
+        target_price_date=target_price_date,
     )
 
     # 4) Format + save
-    pred_df = pd.DataFrame(
-        [{"symbol": s, "pred_1y_logret": lr, "as_of": item["as_of"]} for lr, s, item in top]
-    )
+    pred_df = pd.DataFrame([
+        {
+            "symbol": s,
+            "pred_1y_logret": lr,
+            "as_of": item["as_of"],
+            "current_price": item.get("current_price"),
+            "expected_price": item.get("expected_price"),
+            "expected_price_date": item.get("expected_price_date"),
+        }
+        for lr, s, item in top
+    ])
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     pred_df.to_csv(OUTPUT_CSV, index=False)
     __log.info("Persisted predictions to %s (%d rows)", OUTPUT_CSV, len(pred_df))
