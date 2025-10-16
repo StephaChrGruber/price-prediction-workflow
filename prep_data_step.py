@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from argparse import Namespace
+from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -29,6 +30,22 @@ logging.basicConfig(
 __log = logging.getLogger(__name__)
 
 args: Namespace
+
+
+def _require_parquet(path: str) -> str:
+    """Ensure that a required parquet file exists before processing."""
+
+    parquet_path = Path(path)
+    if parquet_path.exists():
+        return path
+
+    msg = (
+        f"Required parquet file '{parquet_path}' was not found. "
+        f"Run `python data_collection_step.py` first or ensure the file exists "
+        f"relative to '{Path.cwd()}'."
+    )
+    raise FileNotFoundError(msg)
+
 
 def to_dt(s: pl.Series) -> pl.Series:
     return s.dt.replace_time_zone(None).dt.replace(hour=0,minute=0,second=0,microsecond=0)
@@ -333,13 +350,13 @@ def pre_prices():
 def prep_data():
 
     stream_parquet(
-        "data/DailyCryptoData.parquet",
+        _require_parquet("data/DailyCryptoData.parquet"),
         "data/DailyCryptoData.prepped.parquet",
         prep_crypt,
         chunk_rows=100_000
     )
     stream_parquet(
-        "data/DailyStockData.parquet",
+        _require_parquet("data/DailyStockData.parquet"),
         "data/DailyStockData.prepped.parquet",
         prep_stocks,
         chunk_rows=100_000
@@ -353,7 +370,7 @@ def prep_data():
     pre_prices()
 
     stream_parquet(
-        "data/DailyFxData.parquet",
+        _require_parquet("data/DailyFxData.parquet"),
         "data/DailyFxData.prepped.parquet",
         prep_fx,
         chunk_rows=500
