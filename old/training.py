@@ -31,6 +31,7 @@ import os
 import sys
 import gc
 from typing import List, Tuple, Dict
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -77,6 +78,20 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ``old`` contains legacy experimentation scripts that pre-date the
+# productionised workflow that lives at the repository root. Historically these
+# scripts wrote staged Parquet files relative to ``old/`` (for example
+# ``../data``). When executed from the project root this resolved one directory
+# above the repository, while subsequent steps attempted to read from
+# ``data/`` *inside* the repository.  The mismatch resulted in
+# ``FileNotFoundError`` even though staging succeeded.  To make the behaviour
+# explicit and robust regardless of the current working directory we resolve
+# the repository root from this file's location and construct all data paths
+# relative to it.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = REPO_ROOT / "data"
 
 setup_diagnostics()
 logger.info(f"[boot] torch: {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
@@ -1050,10 +1065,11 @@ async def main(args):
             )
             yield df, last_id
 
-    async def stage_news(out_path="data/NewsHeadlines.parquet", resume=True):
+    async def stage_news(out_path=str(DATA_DIR / "NewsHeadlines.parquet"), resume=True):
         schema = news_schema()
         # If the file exists, read its schema so we match order/types:
         target_schema = schema
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         if os.path.exists(out_path):
             try:
                 target_schema = pq.ParquetFile(out_path).schema_arrow
@@ -1138,23 +1154,23 @@ async def main(args):
         ])
 
     await asyncio.gather(stage_collection_with_schema(
-                                out_path="../data/DailyStockData.parquet",
+                                out_path=str(DATA_DIR / "DailyStockData.parquet"),
                                 iter_chunks_fn=iter_stocks_chunks,
                                 canonical_schema=stock_schema(32),  # used only if file doesn't exist yet
                                 resume=True,
                                 compression="zstd"),
-        stage_collection_with_schema(out_path="../data/DailyCryptoData.parquet",
+        stage_collection_with_schema(out_path=str(DATA_DIR / "DailyCryptoData.parquet"),
                                      iter_chunks_fn=iter_crypto_chunks,
                                      canonical_schema=crypto_schema(32),  # used only if file doesn't exist yet
                                      resume=True,
                                      compression="zstd"),
-        stage_collection_with_schema(out_path="../data/DailyWeatherData.parquet",
+        stage_collection_with_schema(out_path=str(DATA_DIR / "DailyWeatherData.parquet"),
                                      iter_chunks_fn=iter_weather_chunks,
                                      canonical_schema=weather_schema(32),  # used only if file doesn't exist yet
                                      resume=True,
                                      compression="zstd"),
         stage_news(),
-        stage_collection_with_schema(out_path="../data/DailyCurrencyExchangeRates.parquet",
+        stage_collection_with_schema(out_path=str(DATA_DIR / "DailyCurrencyExchangeRates.parquet"),
                                      iter_chunks_fn=iter_fx_chunks,
                                      canonical_schema=fx_schema(32),  # used only if file doesn't exist yet
                                      resume=True,
@@ -1162,23 +1178,23 @@ async def main(args):
     )
 
     stream_parquet_process(
-        "data/DailyStockData.parquet",
-        "data/DailyStockData.prepped.parquet",
+        str(DATA_DIR / "DailyStockData.parquet"),
+        str(DATA_DIR / "DailyStockData.prepped.parquet"),
         prep_stocks,
         chunk_rows=100_000,
     )
     stream_parquet_process(
-        "data/DailyCryptoData.parquet",
-        "data/DailyCryptoData.prepped.parquet",
+        str(DATA_DIR / "DailyCryptoData.parquet"),
+        str(DATA_DIR / "DailyCryptoData.prepped.parquet"),
         prep_crypto,
         chunk_rows=100_000,
     )
 
-    stock  = pl.read_parquet("data/DailyStockData.prepped.parquet")
-    crypto = pl.read_parquet("data/DailyCryptoData.prepped.parquet")
-    fx     = pl.read_parquet("data/DailyCurrencyExchangeRates.parquet")
-    news   = pl.read_parquet("data/NewsHeadlines.parquet")
-    wxraw  = pl.read_parquet("data/DailyWeatherData.parquet")
+    stock  = pl.read_parquet(str(DATA_DIR / "DailyStockData.prepped.parquet"))
+    crypto = pl.read_parquet(str(DATA_DIR / "DailyCryptoData.prepped.parquet"))
+    fx     = pl.read_parquet(str(DATA_DIR / "DailyCurrencyExchangeRates.parquet"))
+    news   = pl.read_parquet(str(DATA_DIR / "NewsHeadlines.parquet"))
+    wxraw  = pl.read_parquet(str(DATA_DIR / "DailyWeatherData.parquet"))
 
     logger.info(f"[data] rows: stock={len(stock)} crypto={len(crypto)} fx={len(fx)} news={len(news)} weather={len(wxraw)}")
 
