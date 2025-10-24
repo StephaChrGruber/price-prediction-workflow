@@ -81,7 +81,7 @@ def build_sequences_multi_horizon(panel: pd.DataFrame,
             masks = masks_arr[t]
 
             if require_all:
-                if not np.isfinite(y).all or masks.sum() < H:
+                if not np.isfinite(y).all() or masks.sum() < H:
                     continue
             else:
                 if not np.isfinite(y).any():
@@ -123,8 +123,8 @@ def build_sequences_multi_horizon(panel: pd.DataFrame,
                     continue
 
             win_slice = slice(t - (lookback), t)
-            win_mask = win_slice
-            if not win_mask:
+            win_mask = np.isfinite(feat_arr[win_slice]).all(axis=1)
+            if not win_mask.any():
                 continue
 
             X_Out[idx] = feat_arr[win_slice]
