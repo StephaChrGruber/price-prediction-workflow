@@ -9,6 +9,8 @@ from math import exp
 from pathlib import Path
 from typing import Optional, Mapping, Any, Sequence
 from collections import OrderedDict
+from collections.abc import Sequence as _SequenceABC
+
 import pandas as pd
 import torch
 import numpy as np
@@ -146,6 +148,31 @@ def _duckdb_connection_or_none(con: Any) -> Optional[Any]:
     return None
 
 
+def _normalize_index_list(idx: Optional[Any]) -> list[int]:
+    """Return a predictable list of integer indices for feature selection."""
+
+    if idx is None:
+        return []
+
+    if isinstance(idx, np.ndarray):
+        return [int(i) for i in idx.tolist()]
+
+    if isinstance(idx, _SequenceABC) and not isinstance(idx, (str, bytes)):
+        return [int(i) for i in idx]
+
+    return [int(idx)]
+
+
+def _select_modal_features(x: torch.Tensor, indices: Sequence[int]) -> torch.Tensor:
+    """Slice tensor ``x`` (shape [B, T, F]) along the feature axis."""
+
+    if not indices:
+        return x.new_zeros(x.size(0), x.size(1), 0)
+
+    index_tensor = torch.as_tensor(indices, dtype=torch.long, device=x.device)
+    return torch.index_select(x, dim=-1, index=index_tensor)
+
+
 def score_streaming(model, device, con, q_panel, symbols, as_of_end,
                     lookback, features, tcols, mcols, mean, std,
                     price_idx, fx_idx, top_k=25, rank_horizon_idx=-1,
@@ -187,6 +214,18 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
     if panel_source is not None:
         __log.info("Panel source override inside score_streaming: %s", panel_source)
 
+    price_indices = _normalize_index_list(price_idx)
+    fx_indices = _normalize_index_list(fx_idx)
+
+    if not price_indices:
+        raise ValueError("Metadata does not contain price feature indices; unable to score predictions")
+
+    __log.info(
+        "Resolved feature indices -> price_features=%d fx_features=%d",
+        len(price_indices),
+        len(fx_indices),
+    )
+
     ds = PanelStreamDataset(
         symbols=symbols,
         start=as_of_end,
@@ -210,15 +249,22 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
         target_price_date_str = str(pd.to_datetime(target_price_date).date())
 
     with torch.no_grad():
+        base_price_idx = price_indices[0] if price_indices else None
+
         for sym, X, M, A, _ in tqdm(ds, desc="Iteration"):
             produced = True
             raw_X = X.clone()
             X = X.to(device=device, dtype=model_dtype)
-            X = ((X - mean_t) / std_t).unsqueeze(0)  # [1, T, F]
+            X = (X - mean_t) / std_t
+            X = X.unsqueeze(0)  # [1, T, F]
             M = M.unsqueeze(0).to(device)                       # [1, T]
             A = A.unsqueeze(0).to(device)
-            price_x = X[:, :, price_idx]
-            fx_x = X[:, :, fx_idx]
+            price_x = _select_modal_features(X, price_indices)
+            if price_x.size(-1) == 0:
+                __log.warning("No price features available for %s; skipping", sym)
+                continue
+
+            fx_x = _select_modal_features(X, fx_indices)
             weather_x = torch.zeros(
                 price_x.size(0),
                 price_x.size(1),
@@ -234,12 +280,7 @@ def score_streaming(model, device, con, q_panel, symbols, as_of_end,
             lr = float(pred[0, rank_horizon_idx].detach().cpu())
             processed += 1
             current_price = None
-            base_price_idx = None
-            if isinstance(price_idx, Sequence) and len(price_idx) > 0:
-                base_price_idx = price_idx[0]
-            elif isinstance(price_idx, int):
-                base_price_idx = price_idx
-            if base_price_idx is not None:
+            if base_price_idx is not None and 0 <= base_price_idx < raw_X.shape[1]:
                 try:
                     current_price = float(raw_X[-1, base_price_idx].item())
                 except (IndexError, ValueError):
